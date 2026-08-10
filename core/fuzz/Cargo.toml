@@ -1,0 +1,47 @@
+[package]
+name = "cove-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Пустая таблица workspace отделяет этот крейт от корневого workspace
+# (Фаза 17) — nightly-only RUSTFLAGS для libFuzzer/ASan несовместимы с
+# остальными stable-крейтами.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.cove-core]
+path = ".."
+
+[[bin]]
+name = "fuzz_header"
+path = "fuzz_targets/fuzz_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_keyslots_region"
+path = "fuzz_targets/fuzz_keyslots_region.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_commit_pointer"
+path = "fuzz_targets/fuzz_commit_pointer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_file_table_decode"
+path = "fuzz_targets/fuzz_file_table_decode.rs"
+test = false
+doc = false
+bench = false

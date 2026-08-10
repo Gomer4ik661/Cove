@@ -6,6 +6,10 @@ members = [
     "bindings/android",
     "web/backend",
 ]
+# core/fuzz — отдельный cargo-fuzz проект (Фаза 17, ROADMAP.md), требует
+# nightly + libFuzzer-специфичные RUSTFLAGS, несовместимые с остальным
+# workspace на stable — держим его вне [workspace].
+exclude = ["core/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -53,8 +53,25 @@ impl LockedContainer {
         file.read_exact(&mut header_buf)?;
         let header = Header::parse(&header_buf)?;
 
+        // header — plaintext, без криптографической аутентификации (только
+        // самосогласованный checksum, который злоумышленник может
+        // пересчитать под любые значения полей) — keyslots_len нельзя
+        // напрямую доверять как размер аллокации до какой-либо проверки.
+        // Keyslots region всегда фиксированного размера, так что сверяем
+        // заявленную длину с единственно верной константой вместо того,
+        // чтобы allocate'ить `vec![0u8; header.keyslots_len as usize]` —
+        // иначе специально сфабрикованный .slr с огромным keyslots_len
+        // валит процесс OOM-абортом ещё до ввода пароля (Фаза 17,
+        // найдено при разборе парсера на предмет fuzzing-целей).
+        let expected_keyslots_len = (keyslots::SLOT_LEN * keyslots::CAPACITY) as u64;
+        if header.keyslots_len != expected_keyslots_len {
+            return Err(CoveError::FormatError {
+                detail: "header keyslots_len does not match expected fixed size".into(),
+            });
+        }
+
         file.seek(SeekFrom::Start(header.keyslots_offset))?;
-        let mut keyslots_buf = vec![0u8; header.keyslots_len as usize];
+        let mut keyslots_buf = vec![0u8; expected_keyslots_len as usize];
         file.read_exact(&mut keyslots_buf)?;
         let keyslots = keyslots::parse_region(&keyslots_buf)?;
 
@@ -522,6 +539,20 @@ impl Container {
         file.read_exact(&mut header_buf)?;
         let header = data_blocks::parse_header(&header_buf);
 
+        // block header (включая plaintext_len) лежит перед AEAD-шифртекстом
+        // и им не защищён — тот, у кого есть запись на диск, но нет пароля,
+        // может подменить только это поле, не трогая ciphertext/tag.
+        // Легитимный блок никогда не превышает block_size (Container всегда
+        // режет данные на чанки этого размера при записи) — сверяем ДО
+        // аллокации, иначе испорченный файл заставит честного пользователя
+        // при чтении своих же файлов попытаться выделить до 4ГБ по одному
+        // подделанному полю (Фаза 17, тот же класс бага что и с
+        // header.keyslots_len в LockedContainer::open).
+        if header.plaintext_len as u64 > self.header.block_size as u64 {
+            return Err(CoveError::FormatError {
+                detail: "data block plaintext_len exceeds block_size — corrupted container".into(),
+            });
+        }
         let mut rest = vec![0u8; header.plaintext_len as usize + crate::crypto::aead::TAG_LEN];
         file.read_exact(&mut rest)?;
 
@@ -1281,6 +1312,82 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Фаза 17 — найдено при разборе парсера на предмет fuzzing-целей:
+    /// header не аутентифицирован криптографически (только
+    /// самосогласованный checksum, который злоумышленник волен
+    /// пересчитать под любые значения полей), а `keyslots_len` раньше
+    /// использовался напрямую как размер аллокации ДО того, как
+    /// `keyslots::parse_region` успевал проверить длину — специально
+    /// сфабрикованный файл с огромным `keyslots_len` валил бы процесс
+    /// OOM-абортом ещё до ввода пароля. Теперь `open()` сверяет длину с
+    /// единственно верной константой до аллокации.
+    #[test]
+    fn forged_huge_keyslots_len_rejected_not_oom() {
+        let path = temp_container_path("forged_keyslots_len");
+        let path_str = path.to_str().unwrap();
+        let (c, _recovery) = Container::create(path_str, "admin", "pw12345678").unwrap();
+        c.close().unwrap();
+
+        let mut header_buf = [0u8; header::HEADER_LEN];
+        {
+            let mut f = File::open(path_str).unwrap();
+            f.read_exact(&mut header_buf).unwrap();
+        }
+        let mut h = Header::parse(&header_buf).unwrap();
+        h.keyslots_len = u64::MAX / 2; // заведомо неаллоцируемо, если довериться напрямую
+        let forged = h.serialize(); // пересчитывает checksum — самосогласованный форгед header
+
+        {
+            let mut f = OpenOptions::new().write(true).open(path_str).unwrap();
+            f.write_all(&forged).unwrap();
+        }
+
+        // Не паникует, не виснет на аллокации — честно возвращает ошибку.
+        assert!(matches!(
+            LockedContainer::open(path_str),
+            Err(CoveError::FormatError { .. })
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Фаза 17 — блок-заголовок (включая `plaintext_len`) лежит перед AEAD-
+    /// шифртекстом и им не защищён. Раньше `plaintext_len` использовался
+    /// напрямую как размер аллокации до какой-либо проверки — честный
+    /// пользователь, читающий свой же (испорченный кем-то с доступом на
+    /// запись к файлу) контейнер, мог получить попытку выделить почти 4ГБ
+    /// по одному подделанному полю. Теперь `read_block_at` сверяет
+    /// `plaintext_len` с `block_size` до аллокации.
+    #[test]
+    fn forged_huge_block_plaintext_len_rejected_not_oom() {
+        let path = temp_container_path("forged_block_len");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _recovery) = Container::create(path_str, "admin", "pw12345678").unwrap();
+
+        let src = write_temp_source_file("forged_block_len", b"hello world");
+        let file_id = c.import_file(src.to_str().unwrap(), ROOT_FOLDER_ID).unwrap();
+        let entry = c.list_dir(ROOT_FOLDER_ID).unwrap().into_iter().find(|e| e.file_id == file_id).unwrap();
+        let block_offset = entry.block_list[0];
+        c.close().unwrap();
+
+        // plaintext_len — последние 4 байта заголовка блока (file_id(8) +
+        // block_index(4) + nonce(24) + plaintext_len(4)).
+        let plaintext_len_offset = block_offset + (data_blocks::HEADER_LEN as u64 - 4);
+        {
+            let mut f = OpenOptions::new().write(true).open(path_str).unwrap();
+            f.seek(SeekFrom::Start(plaintext_len_offset)).unwrap();
+            f.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        }
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let unlocked = locked.unlock("admin", "pw12345678").unwrap();
+        // Не паникует, не пытается выделить ~4ГБ — честно возвращает ошибку.
+        assert!(unlocked.read_at(file_id, 0, 11).is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&src);
     }
 
     #[test]

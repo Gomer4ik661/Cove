@@ -184,6 +184,19 @@ pub fn encode_file_table(entries: &[FileEntry], dek: &keys::Dek) -> Vec<u8> {
 pub fn decode_file_table(bytes: &[u8], dek: &keys::Dek) -> Result<Vec<FileEntry>> {
     let mut r = Reader::new(bytes);
     let page_count = r.u32()?;
+    // page_count — часть внешней framing-структуры этого блоба, сама по
+    // себе не защищена AEAD (каждая СТРАНИЦА защищена своим тегом, но не
+    // этот префикс) — тот, у кого есть доступ на запись к файлу-контейнеру,
+    // но нет пароля, может подменить только эти 4 байта. Каждая страница
+    // занимает минимум 4 байта (свой префикс длины), так что заявленное
+    // число страниц физически не может превышать bytes.len()/4 — проверяем
+    // это ДО аллокации Vec, а не после (Фаза 17, тот же класс бага, что и
+    // header.keyslots_len/data_blocks.plaintext_len).
+    if page_count as u64 > bytes.len() as u64 / 4 {
+        return Err(CoveError::FormatError {
+            detail: "file table page_count implausibly large — corrupted container".into(),
+        });
+    }
     let mut page_slices = Vec::with_capacity(page_count as usize);
     for _ in 0..page_count {
         let page_len = r.u32()? as usize;
@@ -281,5 +294,19 @@ mod tests {
         let bytes = encode_file_table(&entries, &dek);
         let decoded = decode_file_table(&bytes, &dek).unwrap();
         assert_eq!(decoded.len(), entries.len());
+    }
+
+    /// Фаза 17 — page_count не защищён AEAD (это framing вокруг страниц, а
+    /// не их содержимое), значит доступен для подмены тому, у кого есть
+    /// доступ на запись к файлу, но нет пароля. Раньше `Vec::with_capacity`
+    /// вызывался с этим значением напрямую — заведомо неправдоподобно
+    /// большой page_count должен отклоняться до аллокации, а не после.
+    #[test]
+    fn forged_huge_page_count_rejected_not_oom() {
+        let dek = Dek::generate();
+        let bytes = encode_file_table(&[], &dek);
+        let mut forged = bytes.clone();
+        forged[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_file_table(&forged, &dek).is_err());
     }
 }

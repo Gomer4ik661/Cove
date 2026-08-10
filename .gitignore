@@ -36,3 +36,9 @@ dist/
 
 # PyInstaller build output (Фаза 16) — dist/ уже выше, здесь — build/.
 /desktop/build/
+
+# cargo-fuzz (Фаза 17) — build output и автосгенерированный corpus/
+# artifacts, не куратируемые вручную входы.
+/core/fuzz/target/
+/core/fuzz/corpus/
+/core/fuzz/artifacts/
