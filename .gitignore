@@ -1,0 +1,34 @@
+/target/
+**/__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+*.so
+*.pyd
+*.dll
+.DS_Store
+
+# Android (Gradle/AGP build output, локальный путь к SDK, кэш Kotlin-компилятора)
+/android/app/build/
+/android/build/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+*.apk
+*.aab
+
+# Контейнеры .slr — пользовательские зашифрованные данные и тестовые
+# артефакты, никогда не место в истории репозитория.
+*.slr
+
+# Личные (per-machine) настройки Claude Code — settings.json (общий) остаётся.
+.claude/settings.local.json
+
+# code-signing секреты — на случай, если кто-то положит их локально рядом
+# с проектом вместо CI secrets (Фаза 16).
+*.pfx
+*.p12
+*.jks
+*.keystore
+!android/release.keystore.example

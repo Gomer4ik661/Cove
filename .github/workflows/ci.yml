@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ARCHITECTURE.md §1: core обязан оставаться чистым Rust, никаких
+  # биндинг-специфичных зависимостей. Ловим нарушение до сборки.
+  architecture-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: core/Cargo.toml не должен зависеть от pyo3/uniffi/axum
+        run: |
+          if grep -Ei '^\s*(pyo3|uniffi|axum)\b' core/Cargo.toml; then
+            echo "::error::core/Cargo.toml тянет биндинг-специфичную зависимость — нарушение ARCHITECTURE.md §1"
+            exit 1
+          fi
+
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (весь workspace)
+        run: cargo test --workspace --verbose
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: build core + android bindings под Android ABIs
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -p cove-core -p cove-android build --release

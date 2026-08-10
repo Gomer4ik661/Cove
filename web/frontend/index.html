@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cove</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<section id="login-screen">
+  <form id="login-form">
+    <h1>Cove</h1>
+    <p class="hint">Веб-доступ к вашему хранилищу</p>
+    <label>Имя пользователя
+      <input type="text" id="login-username" autocomplete="username" required />
+    </label>
+    <label>Пароль
+      <input type="password" id="login-password" autocomplete="current-password" required />
+    </label>
+    <p id="login-error" class="error" hidden></p>
+    <button type="submit">Войти</button>
+  </form>
+</section>
+
+<section id="app-screen" hidden>
+  <header id="top-bar">
+    <div id="breadcrumb"></div>
+    <input type="search" id="search-input" placeholder="Поиск..." />
+    <span id="whoami"></span>
+    <button id="logout-btn" title="Выйти">Выход</button>
+  </header>
+
+  <div id="layout">
+    <nav id="sidebar">
+      <button class="nav-item active" data-view="library">Библиотека</button>
+      <button class="nav-item" data-view="favorites">Избранное</button>
+      <button class="nav-item" data-view="trash">Корзина</button>
+    </nav>
+
+    <main id="content">
+      <div id="toolbar">
+        <button id="new-folder-btn">+ Папка</button>
+        <label class="upload-btn">
+          Загрузить
+          <input type="file" id="upload-input" multiple hidden />
+        </label>
+      </div>
+      <p id="content-error" class="error" hidden></p>
+      <div id="file-grid"></div>
+      <p id="empty-hint" class="hint" hidden>Здесь пока пусто</p>
+    </main>
+  </div>
+</section>
+
+<div id="modal-overlay" hidden>
+  <form id="modal-form">
+    <p id="modal-title"></p>
+    <input type="text" id="modal-input" />
+    <div class="modal-actions">
+      <button type="button" id="modal-cancel" class="secondary">Отмена</button>
+      <button type="submit" id="modal-ok">ОК</button>
+    </div>
+  </form>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

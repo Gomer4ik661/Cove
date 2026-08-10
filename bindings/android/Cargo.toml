@@ -1,0 +1,18 @@
+[package]
+name = "cove-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cove_core_uniffi"
+crate-type = ["cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+cove-core = { path = "../../core" }
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror.workspace = true

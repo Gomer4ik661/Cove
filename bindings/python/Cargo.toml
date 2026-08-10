@@ -1,0 +1,13 @@
+[package]
+name = "cove-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cove_core_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+cove-core = { path = "../../core" }
+pyo3 = { version = "0.29", features = ["extension-module"] }

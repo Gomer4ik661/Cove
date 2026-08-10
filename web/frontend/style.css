@@ -1,0 +1,194 @@
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --text: #1c1e21;
+  --muted: #6b7280;
+  --border: #e2e4e8;
+  --accent: #3d7fff;
+  --accent-text: #ffffff;
+  --danger: #d64545;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --panel: #1e2126;
+    --text: #e8e9ec;
+    --muted: #93979e;
+    --border: #2b2f36;
+    --accent: #5b8dff;
+    --accent-text: #0c111b;
+    --danger: #ff6b6b;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.hint { color: var(--muted); font-size: 0.9rem; }
+.error { color: var(--danger); font-size: 0.9rem; }
+
+#login-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#login-form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+#login-form h1 { margin: 0; }
+
+#login-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+input[type="text"], input[type="password"], input[type="search"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+button {
+  background: var(--accent);
+  color: var(--accent-text);
+  border: none;
+  border-radius: 8px;
+  padding: 0.5rem 1rem;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+button:hover { filter: brightness(1.08); }
+button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+
+#app-screen { display: flex; flex-direction: column; height: 100vh; }
+
+#top-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+#breadcrumb { flex: 1; font-size: 0.95rem; }
+#breadcrumb span { cursor: pointer; color: var(--accent); }
+#breadcrumb span.current { color: var(--text); cursor: default; }
+
+#search-input { width: 220px; }
+#whoami { color: var(--muted); font-size: 0.85rem; }
+
+#layout { flex: 1; display: flex; min-height: 0; }
+
+#sidebar {
+  width: 180px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 1rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.nav-item {
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  border-radius: 6px;
+}
+.nav-item.active { background: var(--accent); color: var(--accent-text); }
+
+#content { flex: 1; padding: 1rem; overflow-y: auto; }
+
+#toolbar { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+.upload-btn { background: var(--accent); color: var(--accent-text); border-radius: 8px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.95rem; }
+
+#file-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+
+.file-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.file-card .icon { font-size: 1.8rem; }
+.file-card .name {
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-card .meta { font-size: 0.75rem; color: var(--muted); }
+
+.file-card .actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.file-card .actions button {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.75rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.file-card .actions button.danger { color: var(--danger); }
+.file-card .actions button.favorite.active { color: #e0a200; border-color: #e0a200; }
+
+#modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+#modal-form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+#modal-title { margin: 0; font-size: 0.95rem; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
