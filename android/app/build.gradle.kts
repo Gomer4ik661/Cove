@@ -1,7 +1,22 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Фаза 16 (ROADMAP.md) — реальная подпись release-сборок настоящим
+// keystore. Файл с паролями не в git (.gitignore) — см.
+// android/keystore.properties.example для формата. Без него release-сборка
+// собирается неподписанной (сработает только через CI secrets — см.
+// .github/workflows/release.yml), но НЕ падает — иначе обычный
+// `assembleDebug`/`cargo test`-стиль CI-джобы без доступа к секретам
+// ломались бы на конфигурации, которая им не нужна.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(keystorePropertiesFile.inputStream())
 }
 
 android {
@@ -19,9 +34,23 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -68,4 +97,12 @@ dependencies {
     // 5.17+ — libjnidispatch.so в 5.15 был выровнен под 4KB-страницы,
     // что триггерило PageSizeMismatchDialog на 16KB-эмуляторах/устройствах.
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+
+    // media3 — видео/аудио-плеер поверх кастомного DataSource
+    // (media/ContainerDataSource.kt), стримящего байты через
+    // container.readAt() без временных расшифрованных файлов на диске —
+    // Android-аналог desktop ContainerFileDevice (ROADMAP.md Фаза 14,
+    // доработка после того как обнаружился пробел с просмотрщиками).
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
 }

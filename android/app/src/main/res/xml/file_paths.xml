@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Только cache/exports — временные расшифрованные копии для "открыть во
+     внешнем приложении" (media/ExternalOpen.kt). Ничего больше наружу не
+     светим через FileProvider. -->
+<paths>
+    <cache-path name="exports" path="exports/" />
+</paths>

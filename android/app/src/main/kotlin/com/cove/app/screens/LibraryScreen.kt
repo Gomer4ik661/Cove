@@ -4,6 +4,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -45,15 +47,25 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
+import com.cove.app.media.FileKind
+import com.cove.app.media.decodeBitmap
+import com.cove.app.media.exportForExternalOpen
+import com.cove.app.media.generateThumbnailBytes
+import com.cove.app.media.kindOf
+import com.cove.app.media.launchExternalViewIntent
 import com.cove.app.storage.ThemeMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -101,6 +113,22 @@ fun LibraryScreen(
         return
     }
 
+    // Просмотрщики (Фаза 14, доработка) — та же диспетчеризация по типу,
+    // что и в desktop viewer_dialog.py: image/video/audio/text открываются
+    // во встроенном просмотрщике, всё остальное (pdf, RAW и т.п.) честно
+    // предлагает открыть во внешнем приложении вместо молчаливого тапа.
+    var viewingFile by remember { mutableStateOf<FileEntry?>(null) }
+    val openingFile = viewingFile
+    if (openingFile != null) {
+        when (kindOf(openingFile.name)) {
+            FileKind.IMAGE -> ImageViewerScreen(container, openingFile, onBack = { viewingFile = null })
+            FileKind.VIDEO, FileKind.AUDIO -> MediaViewerScreen(container, openingFile, onBack = { viewingFile = null })
+            FileKind.TEXT, FileKind.MARKDOWN -> TextViewerScreen(container, openingFile, onBack = { viewingFile = null })
+            FileKind.UNKNOWN -> Unit // не должно случиться — см. openFile() ниже
+        }
+        return
+    }
+
     var section by remember { mutableStateOf<Section>(Section.Root) }
     var folderStack by remember { mutableStateOf(listOf(FolderCrumb(0uL, "Библиотека"))) }
     var entries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
@@ -110,6 +138,11 @@ fun LibraryScreen(
     var fabMenuExpanded by remember { mutableStateOf(false) }
     var refreshKey by remember { mutableStateOf(0) }
     var exportTarget by remember { mutableStateOf<FileEntry?>(null) }
+    var externalOpenTarget by remember { mutableStateOf<FileEntry?>(null) }
+    // Кэш декодированных миниатюр на время сессии экрана — без него каждый
+    // повторный вход строки фото в композицию (например, при скролле назад)
+    // заново гонял бы decode+readAt.
+    val thumbnailCache = remember { mutableStateMapOf<ULong, ImageBitmap>() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -118,6 +151,14 @@ fun LibraryScreen(
 
     fun refresh() {
         refreshKey++
+    }
+
+    fun openFile(entry: FileEntry) {
+        if (kindOf(entry.name) == FileKind.UNKNOWN) {
+            externalOpenTarget = entry
+        } else {
+            viewingFile = entry
+        }
     }
 
     fun selectSection(target: Section) {
@@ -329,10 +370,16 @@ fun LibraryScreen(
                         // "Type of the key ... is not supported" при непустом списке.
                         items(entries, key = { it.fileId.toLong() }) { entry ->
                             FileRow(
+                                container = container,
                                 entry = entry,
+                                thumbnailCache = thumbnailCache,
                                 onClick = {
-                                    if (entry.isFolder && section is Section.Root) {
-                                        folderStack = folderStack + FolderCrumb(entry.fileId, entry.name)
+                                    if (entry.isFolder) {
+                                        if (section is Section.Root) {
+                                            folderStack = folderStack + FolderCrumb(entry.fileId, entry.name)
+                                        }
+                                    } else {
+                                        openFile(entry)
                                     }
                                 },
                                 onToggleFavorite = {
@@ -380,26 +427,102 @@ fun LibraryScreen(
                     },
                 )
             }
+
+            val unsupportedTarget = externalOpenTarget
+            if (unsupportedTarget != null) {
+                AlertDialog(
+                    onDismissRequest = { externalOpenTarget = null },
+                    title = { Text("Открыть во внешнем приложении?") },
+                    text = {
+                        Text(
+                            "Для «${unsupportedTarget.name}» ещё нет встроенного просмотрщика в Cove. " +
+                                "Открыть во внешнем приложении?",
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            externalOpenTarget = null
+                            scope.launch {
+                                try {
+                                    val uri = withContext(Dispatchers.IO) {
+                                        exportForExternalOpen(context, container, unsupportedTarget)
+                                    }
+                                    launchExternalViewIntent(context, uri, unsupportedTarget.name)
+                                } catch (e: Exception) {
+                                    error = "Не удалось открыть файл: ${e.message}"
+                                }
+                            }
+                        }) { Text("Открыть") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { externalOpenTarget = null }) { Text("Отмена") }
+                    },
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun FileRow(
+    container: AndroidContainer,
     entry: FileEntry,
+    thumbnailCache: androidx.compose.runtime.snapshots.SnapshotStateMap<ULong, ImageBitmap>,
     onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
     onDelete: () -> Unit,
     onExport: () -> Unit,
 ) {
+    // Миниатюра — только для фото: находим уже сгенерированную (findThumbnail)
+    // либо декодируем оригинал и генерируем новую через container.thumbnail()
+    // (ROADMAP.md Фаза 8, доработка после того как обнаружилось, что на
+    // Android миниатюры вообще не появлялись — Фазу 14 портировали без них).
+    val isImage = !entry.isFolder && kindOf(entry.name) == FileKind.IMAGE
+    LaunchedEffect(entry.fileId, isImage) {
+        if (!isImage || thumbnailCache.containsKey(entry.fileId)) return@LaunchedEffect
+        val bitmap = withContext(Dispatchers.IO) {
+            try {
+                val existingId = container.findThumbnail(entry.fileId)
+                val pngBytes = if (existingId != null) {
+                    container.readAt(existingId, 0uL, container.fileSize(existingId).toUInt())
+                } else {
+                    val original = container.readAt(entry.fileId, 0uL, entry.size.toUInt())
+                    val generated = generateThumbnailBytes(original) ?: return@withContext null
+                    container.thumbnail(entry.fileId, generated)
+                    generated
+                }
+                decodeBitmap(pngBytes)
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (bitmap != null) thumbnailCache[entry.fileId] = bitmap.asImageBitmap()
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = entry.isFolder, onClick = onClick)
+            .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
+        if (isImage) {
+            val thumb = thumbnailCache[entry.fileId]
+            Box(modifier = Modifier.size(48.dp)) {
+                if (thumb != null) {
+                    Image(
+                        bitmap = thumb,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.size(48.dp),
+                    )
+                } else {
+                    Text("🖼", style = MaterialTheme.typography.headlineMedium)
+                }
+            }
+            androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(start = 8.dp))
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 if (entry.isFolder) "📁 ${entry.name}" else entry.name,

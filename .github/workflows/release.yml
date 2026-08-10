@@ -1,0 +1,165 @@
+name: Release
+
+# Фаза 16 (ROADMAP.md) — реальная упаковка, а не только `cargo test` (это
+# уже делает ci.yml). Собирает распространяемые артефакты для трёх
+# платформ и публикует их в GitHub Release при пуше тега вида v1.2.3.
+# workflow_dispatch — чтобы можно было прогнать вручную без тега, пока
+# отлаживается сам workflow.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+env:
+  # Версия должна совпадать с тем, что реально стоит на машине, где
+  # писался и проверялся .cargo/config.toml (см. Фазу 14) — r27d.
+  NDK_VERSION: r27d
+
+jobs:
+  linux-desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build cove-python (release)
+        run: cargo build --release -p cove-python
+
+      - name: cove_core_py.so под плоским именем (см. scripts/build_python_bindings.sh)
+        run: cp target/release/libcove_core_py.so desktop/cove_core_py.so
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: venv + PySide6 + PyInstaller
+        run: |
+          python3 -m venv desktop/.venv
+          desktop/.venv/bin/pip install --upgrade pip
+          desktop/.venv/bin/pip install PySide6 pyinstaller
+
+      - name: PyInstaller (desktop/cove.spec)
+        working-directory: desktop
+        run: .venv/bin/pyinstaller --noconfirm cove.spec
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cove-linux
+          path: desktop/dist/Cove
+
+  windows-desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build cove-python (release)
+        run: cargo build --release -p cove-python
+
+      # На Windows cdylib собирается как cove_core_py.dll (без префикса
+      # "lib" — так уже называет cargo на этой платформе). CPython ищет
+      # C-расширения по суффиксу .pyd — переименование, аналог того, что
+      # build_python_bindings.sh делает для .so на Linux.
+      - name: cove_core_py.pyd под плоским именем
+        shell: pwsh
+        run: Copy-Item target\release\cove_core_py.dll desktop\cove_core_py.pyd
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: venv + PySide6 + PyInstaller
+        shell: pwsh
+        run: |
+          python -m venv desktop\.venv
+          desktop\.venv\Scripts\pip install --upgrade pip
+          desktop\.venv\Scripts\pip install PySide6 pyinstaller
+
+      - name: PyInstaller (desktop/cove.spec)
+        working-directory: desktop
+        shell: pwsh
+        run: .venv\Scripts\pyinstaller --noconfirm cove.spec
+
+      # НЕ подписано — Windows code signing требует настоящего
+      # сертификата от CA, которого пока нет (ROADMAP.md Фаза 16,
+      # сознательно отложено, а не сымитировано self-signed сертификатом).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cove-windows-unsigned
+          path: desktop/dist/Cove.exe
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # .cargo/config.toml (корень репозитория) хардкодит линкеры под
+      # /opt/android-ndk — тот же путь, который ставит AUR-пакет
+      # android-ndk-27 на машине, где разрабатывался и проверялся Android-
+      # билд (Фаза 14). Кладём NDK туда же в CI вместо того, чтобы менять
+      # рабочий локальный конфиг ради переносимости — меньше риск что-то
+      # сломать на уже проверенной настройке.
+      - name: Android NDK ${{ env.NDK_VERSION }} -> /opt/android-ndk
+        run: |
+          curl -fsSL -o ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          sudo unzip -q ndk.zip -d /opt
+          sudo mv "/opt/android-ndk-${NDK_VERSION}" /opt/android-ndk
+          rm ndk.zip
+
+      - name: cargo build + uniffi-bindgen (scripts/build_android_bindings.sh)
+        run: |
+          chmod +x scripts/build_android_bindings.sh
+          ./scripts/build_android_bindings.sh
+
+      - name: release.keystore из GitHub Secrets
+        working-directory: android
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+          cat > keystore.properties <<PROPS
+          storeFile=release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          PROPS
+
+      - name: gradlew assembleRelease
+        working-directory: android
+        run: ./gradlew assembleRelease --console=plain
+
+      - name: подпись reального APK — не падаем молча на неподписанном
+        working-directory: android
+        run: |
+          "$ANDROID_SDK_ROOT/build-tools"/*/apksigner verify --verbose \
+            app/build/outputs/apk/release/app-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cove-android-release
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-desktop, windows-desktop, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: GitHub Release с артефактами трёх платформ
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            cove-linux/Cove
+            cove-windows-unsigned/Cove.exe
+            cove-android-release/app-release.apk

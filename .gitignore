@@ -25,10 +25,14 @@ dist/
 # Личные (per-machine) настройки Claude Code — settings.json (общий) остаётся.
 .claude/settings.local.json
 
-# code-signing секреты — на случай, если кто-то положит их локально рядом
-# с проектом вместо CI secrets (Фаза 16).
+# code-signing секреты — реальный android/release.keystore и
+# android/keystore.properties сюда попадают, .example-шаблон — обычный
+# .keystore/.properties, не .example, поэтому не нужен отдельный !negate.
 *.pfx
 *.p12
 *.jks
 *.keystore
-!android/release.keystore.example
+/android/keystore.properties
+
+# PyInstaller build output (Фаза 16) — dist/ уже выше, здесь — build/.
+/desktop/build/
