@@ -255,7 +255,7 @@ class MainWindow(QMainWindow):
 
         self._content_list = _DropListWidget(
             on_files_dropped=self._handle_dropped_files,
-            can_accept_drop=lambda: self._section_kind == "root",
+            can_accept_drop=lambda: self._section_kind in ("root", "category"),
         )
         self._content_list.setViewMode(QListWidget.ViewMode.IconMode)
         self._content_list.setUniformItemSizes(True)
@@ -272,7 +272,7 @@ class MainWindow(QMainWindow):
 
         self._empty_label = _DropLabel(
             on_files_dropped=self._handle_dropped_files,
-            can_accept_drop=lambda: self._section_kind == "root",
+            can_accept_drop=lambda: self._section_kind in ("root", "category"),
         )
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -430,7 +430,9 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         self._back_button.setEnabled(tab.history_pos > 0)
         self._forward_button.setEnabled(tab.history_pos < len(tab.history) - 1)
-        self._up_button.setEnabled(self._section_kind == "root" and bool(self._folder_stack))
+        self._up_button.setEnabled(
+            self._section_kind in ("root", "category") and bool(self._folder_stack)
+        )
 
     def _go_back(self) -> None:
         tab = self._current_tab()
@@ -473,9 +475,10 @@ class MainWindow(QMainWindow):
         if entry is None:
             return
         if entry.is_folder:
-            # Папки существуют только в реальном дереве — в category/
-            # favorite/recent-разделах список плоский, навигация туда не ведёт.
-            if self._section_kind == "root":
+            # Папки существуют в реальном дереве — root и category (теперь
+            # тоже навигация по папкам, только с фильтром по типу файла).
+            # В favorite/recent список плоский, навигация туда не ведёт.
+            if self._section_kind in ("root", "category"):
                 self._navigate_into(entry.file_id, entry.name)
         else:
             open_viewer(self._container, entry, self)
@@ -547,9 +550,24 @@ class MainWindow(QMainWindow):
                 entries = self._container.search(
                     name_contains=search_text or None, folder_id=self._current_folder_id()
                 )
+            elif self._section_kind == "category" and not search_text:
+                # Раньше был плоский search(category=...) без привязки к
+                # папке — новая папка, созданная во вкладке "Фото", в неё не
+                # попадала (только в "Библиотеку"). Теперь та же навигация по
+                # папкам, что и в root, только с фильтром файлов по категории
+                # на клиенте — папки показываются всегда, независимо от того,
+                # что внутри (жалоба пользователя: "при создании папки в
+                # вкладке фото оно не отображается в фото").
+                entries = self._container.list_dir(self._current_folder_id())
+                entries = [
+                    e for e in entries
+                    if e.is_folder or file_kind.category_of(e.name) == self._section_extra
+                ]
             elif self._section_kind == "category":
                 entries = self._container.search(
-                    name_contains=search_text or None, category=self._section_extra
+                    name_contains=search_text or None,
+                    folder_id=self._current_folder_id(),
+                    category=self._section_extra,
                 )
             elif self._section_kind == "favorite":
                 entries = self._container.search(name_contains=search_text or None, favorite=True)
@@ -560,8 +578,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Cove", f"Не удалось получить содержимое: {exc}")
             entries = []
 
-        self._import_action.setEnabled(self._section_kind == "root")
-        self._new_folder_action.setEnabled(self._section_kind == "root")
+        self._import_action.setEnabled(self._section_kind in ("root", "category"))
+        self._new_folder_action.setEnabled(self._section_kind in ("root", "category"))
 
         self._content_list.clear()
         for entry in entries:
@@ -636,7 +654,7 @@ class MainWindow(QMainWindow):
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self)
 
-        if self._section_kind == "root":
+        if self._section_kind in ("root", "category"):
             menu.addAction("Импортировать файл…", self._import_files_dialog)
             menu.addAction("Новая папка…", self._new_folder_dialog)
 
@@ -647,7 +665,7 @@ class MainWindow(QMainWindow):
                 menu.addAction("Восстановить", lambda: self._restore_entry(entry))
                 menu.addAction("Удалить навсегда", lambda: self._delete_entry(entry, permanent=True))
             else:
-                if entry.is_folder and self._section_kind == "root":
+                if entry.is_folder and self._section_kind in ("root", "category"):
                     menu.addAction("Открыть", lambda: self._navigate_into(entry.file_id, entry.name))
                 elif not entry.is_folder:
                     menu.addAction("Просмотреть", lambda: open_viewer(self._container, entry, self))

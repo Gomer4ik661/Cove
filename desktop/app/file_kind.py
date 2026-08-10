@@ -13,6 +13,23 @@ def extension_of(name: str) -> str:
     return Path(name).suffix.lower().lstrip(".")
 
 
+def category_of(name: str) -> str:
+    """Категория для вкладок Фото/Видео/Документы/Музыка (SECTIONS в
+    main_window.py) — та же классификация, что и Core::categorize()
+    (core/src/container/mod.rs), используется для клиентской фильтрации
+    list_dir() при построении навигируемых по папкам category-разделов."""
+    ext = extension_of(name)
+    if ext in IMAGE_EXT:
+        return "image"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in AUDIO_EXT:
+        return "audio"
+    if ext in TEXT_EXT | MARKDOWN_EXT | PDF_EXT:
+        return "document"
+    return "other"
+
+
 def kind_of(name: str) -> str:
     ext = extension_of(name)
     if ext in IMAGE_EXT:

@@ -47,6 +47,7 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,13 +62,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import com.cove.app.media.FileKind
+import com.cove.app.media.categoryOf
 import com.cove.app.media.decodeBitmap
 import com.cove.app.media.exportForExternalOpen
 import com.cove.app.media.generateThumbnailBytes
 import com.cove.app.media.kindOf
 import com.cove.app.media.launchExternalViewIntent
 import com.cove.app.storage.ThemeMode
+import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.cove_core_uniffi.AndroidContainer
@@ -149,6 +154,29 @@ fun LibraryScreen(
 
     val currentFolder = folderStack.last()
 
+    // Незавершённые операции с container (импорт/создание папки/удаление и
+    // т.п.) — "Выход" обязан дождаться их ПЕРЕД close(), иначе возможна
+    // настоящая гонка: пользователь запускает импорт (SAF-чтение + запись в
+    // File Table — не мгновенно для больших файлов), тут же жмёт "Выход" —
+    // close() мог успеть отработать раньше, чем импорт домутировал File
+    // Table, и это молча теряло файл (AndroidContainer.close_container()
+    // забирает contener из Mutex<Option<_>>, следующий вызов импорта просто
+    // получает AndroidError.Closed — а экран к этому моменту уже сменился
+    // на Welcome, поэтому даже эта ошибка никогда не была видна). Найдено
+    // по жалобе пользователя: "загрузил файлы, вышел, зашёл — пусто".
+    val pendingWrites = remember { mutableStateListOf<Job>() }
+    fun launchWrite(block: suspend () -> Unit) {
+        lateinit var job: Job
+        job = scope.launch {
+            try {
+                block()
+            } finally {
+                pendingWrites.remove(job)
+            }
+        }
+        pendingWrites.add(job)
+    }
+
     fun refresh() {
         refreshKey++
     }
@@ -174,14 +202,37 @@ fun LibraryScreen(
     // временный доступ на чтение к выбранному файлу.
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
+        launchWrite {
             try {
                 val name = queryDisplayName(uri, context) ?: uri.lastPathSegment ?: "imported_file"
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: throw IllegalStateException("не удалось открыть файл")
+                withContext(Dispatchers.IO) {
+                    // Потоковое копирование в cacheDir вместо readBytes() в
+                    // ByteArray целиком: на больших файлах (сотни МБ) второй
+                    // вариант падает с OutOfMemoryError — heap growth limit
+                    // Dalvik/ART (~192-256МБ) намного меньше, чем размер
+                    // файла, а container.importFile(path) в Core читает файл
+                    // блоками через File::open, не требуя буферизации.
+                    // Core::import_file берёт имя файла из последнего
+                    // компонента пути — отдельная поддиректория на каждый
+                    // импорт нужна, чтобы temp-файл назывался ровно как
+                    // оригинал (иначе в библиотеке файл сохранится под
+                    // техническим именем).
+                    val importDir = File(context.cacheDir, "imports/${System.nanoTime()}").apply { mkdirs() }
+                    try {
+                        // name приходит от content-провайдера (недоверенный
+                        // источник) — берём только последний компонент пути,
+                        // чтобы "../"-подобное имя не вывело файл за пределы
+                        // importDir.
+                        val safeName = File(name).name.ifEmpty { "imported_file" }
+                        val tempFile = File(importDir, safeName)
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            tempFile.outputStream().use { output -> input.copyTo(output) }
+                        } ?: throw IllegalStateException("не удалось открыть файл")
+                        container.importFile(tempFile.absolutePath, currentFolder.id)
+                    } finally {
+                        importDir.deleteRecursively()
+                    }
                 }
-                withContext(Dispatchers.IO) { container.importFileFromBytes(name, currentFolder.id, bytes) }
                 refresh()
             } catch (e: Exception) {
                 error = "Не удалось импортировать файл: ${e.message}"
@@ -196,7 +247,7 @@ fun LibraryScreen(
         val target = exportTarget
         exportTarget = null
         if (uri == null || target == null) return@rememberLauncherForActivityResult
-        scope.launch {
+        launchWrite {
             try {
                 withContext(Dispatchers.IO) {
                     // Файл целиком в память за один readAt — тот же осознанный
@@ -222,7 +273,16 @@ fun LibraryScreen(
             entries = withContext(Dispatchers.IO) {
                 when (val current = section) {
                     is Section.Root -> container.listDir(currentFolder.id)
-                    is Section.Category -> container.search(SearchQuery(category = current.category))
+                    // Раньше был плоский search(category=...) без привязки к
+                    // папке — новая папка, созданная во вкладке "Фото", в неё
+                    // не попадала (только в "Библиотеку"). Теперь та же
+                    // навигация по папкам, что и в Root, только с фильтром
+                    // файлов по категории на клиенте — папки показываются
+                    // всегда, независимо от того, что внутри (жалоба
+                    // пользователя: "при создании папки в вкладке фото оно
+                    // не отображается в фото").
+                    is Section.Category -> container.listDir(currentFolder.id)
+                        .filter { it.isFolder || categoryOf(it.name) == current.category }
                     is Section.Favorites -> container.search(SearchQuery(favorite = true))
                 }
             }
@@ -280,8 +340,11 @@ fun LibraryScreen(
                 TopAppBar(
                     title = {
                         Text(
-                            if (section is Section.Root) folderStack.joinToString(" / ") { it.name }
-                            else section.title,
+                            when (section) {
+                                is Section.Root -> folderStack.joinToString(" / ") { it.name }
+                                is Section.Category -> section.title + " / " + folderStack.joinToString(" / ") { it.name }
+                                is Section.Favorites -> section.title
+                            },
                         )
                     },
                     navigationIcon = {
@@ -290,7 +353,7 @@ fun LibraryScreen(
                         }
                     },
                     actions = {
-                        if (section is Section.Root && folderStack.size > 1) {
+                        if ((section is Section.Root || section is Section.Category) && folderStack.size > 1) {
                             TextButton(onClick = { folderStack = folderStack.dropLast(1) }) {
                                 Text("Назад")
                             }
@@ -302,7 +365,15 @@ fun LibraryScreen(
                             // процесс может быть убит раньше, чем commit случится, и
                             // несохранённые изменения потеряются (найдено вживую: после
                             // удаления папки и быстрого выхода она "возвращалась").
+                            //
+                            // Мало дождаться самого close() — сначала обязательно
+                            // дождаться ВСЕХ ещё не завершившихся launchWrite()
+                            // (например, импорт файла, запущенный за миг до тапа на
+                            // "Выход"): иначе close() может выполниться раньше и
+                            // забрать container из Mutex, и незавершённый импорт
+                            // молча потеряет файл (см. комментарий у pendingWrites).
                             scope.launch {
+                                pendingWrites.toList().joinAll()
                                 withContext(Dispatchers.IO) { container.closeContainer() }
                                 onLogout()
                             }
@@ -311,12 +382,14 @@ fun LibraryScreen(
                 )
             },
             floatingActionButton = {
-                // Доступно во всех разделах, не только в дереве папок — у
-                // виртуальных разделов (категория/избранное) нет своей
-                // "текущей папки", поэтому и "Новая папка", и "Загрузить
-                // файл" в них кладут результат в корень библиотеки
-                // (currentFolder.id всегда 0 вне Section.Root — folderStack
-                // сбрасывается в selectSection()).
+                // Доступно во всех разделах. Root и Category — настоящая
+                // навигация по папкам (currentFolder.id = folderStack.last().id),
+                // поэтому "Новая папка"/"Загрузить файл" в Category кладут
+                // результат в текущую (под-)папку этой категории, а не в
+                // корень. У Favorites своей "текущей папки" нет — там
+                // currentFolder.id всегда 0 (folderStack сбрасывается в
+                // selectSection() и никогда не растёт, т.к. клик по папке
+                // обрабатывается только для Root/Category выше).
                 Box {
                     FloatingActionButton(onClick = { fabMenuExpanded = true }) {
                         Icon(Icons.Filled.Add, contentDescription = "Добавить")
@@ -375,7 +448,7 @@ fun LibraryScreen(
                                 thumbnailCache = thumbnailCache,
                                 onClick = {
                                     if (entry.isFolder) {
-                                        if (section is Section.Root) {
+                                        if (section is Section.Root || section is Section.Category) {
                                             folderStack = folderStack + FolderCrumb(entry.fileId, entry.name)
                                         }
                                     } else {
@@ -383,7 +456,7 @@ fun LibraryScreen(
                                     }
                                 },
                                 onToggleFavorite = {
-                                    scope.launch {
+                                    launchWrite {
                                         try {
                                             withContext(Dispatchers.IO) {
                                                 container.setFavorite(entry.fileId, !entry.favorite)
@@ -395,7 +468,7 @@ fun LibraryScreen(
                                     }
                                 },
                                 onDelete = {
-                                    scope.launch {
+                                    launchWrite {
                                         try {
                                             withContext(Dispatchers.IO) { container.deleteFile(entry.fileId) }
                                             refresh()
@@ -416,7 +489,7 @@ fun LibraryScreen(
                     onDismiss = { showNewFolderDialog = false },
                     onConfirm = { name ->
                         showNewFolderDialog = false
-                        scope.launch {
+                        launchWrite {
                             try {
                                 withContext(Dispatchers.IO) { container.createFolder(name, currentFolder.id) }
                                 refresh()
@@ -442,7 +515,7 @@ fun LibraryScreen(
                     confirmButton = {
                         TextButton(onClick = {
                             externalOpenTarget = null
-                            scope.launch {
+                            launchWrite {
                                 try {
                                     val uri = withContext(Dispatchers.IO) {
                                         exportForExternalOpen(context, container, unsupportedTarget)

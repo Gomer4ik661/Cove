@@ -15,6 +15,28 @@ enum class FileKind { IMAGE, VIDEO, AUDIO, TEXT, MARKDOWN, UNKNOWN }
 
 fun extensionOf(name: String): String = name.substringAfterLast('.', "").lowercase()
 
+// Категория "по типу" для вкладок Фото/Видео/Документы (Section.Category в
+// LibraryScreen.kt) — та же классификация, что и Core::categorize()
+// (core/src/container/mod.rs), используется для клиентской фильтрации
+// listDir(), т.к. у FileEntry нет собственного поля category.
+private val CATEGORY_IMAGE_EXT = setOf(
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "heif", "heic", "bmp", "tif", "tiff",
+)
+private val CATEGORY_VIDEO_EXT = setOf("mp4", "mkv", "avi", "mov", "webm")
+private val CATEGORY_AUDIO_EXT = setOf("mp3", "flac", "aac", "ogg")
+private val CATEGORY_DOCUMENT_EXT = setOf("pdf", "txt", "md")
+
+fun categoryOf(name: String): String {
+    val ext = extensionOf(name)
+    return when {
+        ext in CATEGORY_IMAGE_EXT -> "image"
+        ext in CATEGORY_VIDEO_EXT -> "video"
+        ext in CATEGORY_AUDIO_EXT -> "audio"
+        ext in CATEGORY_DOCUMENT_EXT -> "document"
+        else -> "other"
+    }
+}
+
 fun kindOf(name: String): FileKind {
     val ext = extensionOf(name)
     return when {
