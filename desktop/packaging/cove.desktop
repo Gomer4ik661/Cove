@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Cove
+Comment=Зашифрованное файловое хранилище
+Exec=Cove
+Icon=cove
+Categories=Utility;Security;
+Terminal=false

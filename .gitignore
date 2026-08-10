@@ -42,3 +42,10 @@ dist/
 /core/fuzz/target/
 /core/fuzz/corpus/
 /core/fuzz/artifacts/
+
+# AppImage (Фаза 16/17) — appimagetool (скачивается скриптом),
+# промежуточный AppDir и итоговый .AppImage — всё воспроизводимо из
+# scripts/build_appimage.sh, не артефакты для коммита.
+/desktop/packaging/appimagetool-*.AppImage
+/desktop/packaging/AppDir/
+*.AppImage
