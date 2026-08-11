@@ -92,6 +92,7 @@ pub struct FileEntry {
     pub trashed: bool,
     pub favorite: bool,
     pub is_folder: bool,
+    pub folder_category: Option<String>,
 }
 
 impl From<CoreFileEntry> for FileEntry {
@@ -107,6 +108,7 @@ impl From<CoreFileEntry> for FileEntry {
             trashed: e.flags.trashed,
             favorite: e.flags.favorite,
             is_folder: e.flags.is_folder,
+            folder_category: e.folder_category,
         }
     }
 }
@@ -337,8 +339,13 @@ impl AndroidContainer {
         self.with(|c| c.export_file(file_id, &dest_path))
     }
 
-    fn create_folder(&self, name: String, parent_id: u64) -> Result<u64, AndroidError> {
-        self.with_mut(|c| c.create_folder(&name, parent_id))
+    fn create_folder(
+        &self,
+        name: String,
+        parent_id: u64,
+        category: Option<String>,
+    ) -> Result<u64, AndroidError> {
+        self.with_mut(|c| c.create_folder(&name, parent_id, category.as_deref()))
     }
 
     fn delete_file(&self, file_id: u64) -> Result<(), AndroidError> {

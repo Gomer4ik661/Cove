@@ -701,6 +701,7 @@ impl Container {
                     ..Default::default()
                 },
                 thumbnail_of: Some(file_id),
+                folder_category: None,
             });
         }
         Ok(thumb_id)
@@ -734,6 +735,7 @@ impl Container {
             block_list,
             flags: file_table::FileFlags::default(),
             thumbnail_of: None,
+            folder_category: None,
         });
         Ok(file_id)
     }
@@ -775,6 +777,7 @@ impl Container {
             block_list,
             flags: file_table::FileFlags::default(),
             thumbnail_of: None,
+            folder_category: None,
         });
         Ok(file_id)
     }
@@ -823,7 +826,16 @@ impl Container {
         Ok(())
     }
 
-    pub fn create_folder(&mut self, name: &str, parent_id: FileId) -> Result<FileId> {
+    /// `category` — категория вкладки (`"image"`/`"video"`/`"document"`/…),
+    /// в которой пользователь создал папку, или `None` для "Библиотеки"
+    /// (см. `FileEntry::folder_category`). Привязывается один раз при
+    /// создании, дальше не пересчитывается.
+    pub fn create_folder(
+        &mut self,
+        name: &str,
+        parent_id: FileId,
+        category: Option<&str>,
+    ) -> Result<FileId> {
         self.require_writable()?;
         if name.is_empty() {
             return Err(CoveError::FormatError {
@@ -851,6 +863,7 @@ impl Container {
                 ..Default::default()
             },
             thumbnail_of: None,
+            folder_category: category.map(|c| c.to_string()),
         });
         Ok(file_id)
     }
@@ -1686,7 +1699,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
 
-        let folder_id = c.create_folder("Фото", ROOT_FOLDER_ID).unwrap();
+        let folder_id = c.create_folder("Фото", ROOT_FOLDER_ID, None).unwrap();
         let content = b"a photo, sort of".to_vec();
         let src = write_temp_source_file("folder_file", &content);
         let file_id = c.import_file(src.to_str().unwrap(), ROOT_FOLDER_ID).unwrap();
@@ -1706,6 +1719,43 @@ mod tests {
         c.close().unwrap();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&src);
+    }
+
+    /// По прямому запросу пользователя: папка "привязывается" к категории
+    /// вкладки, в которой создана, а не пересчитывается по содержимому —
+    /// см. `FileEntry::folder_category`. Проверяет и сохранение значения
+    /// через close/reopen (не только в памяти).
+    #[test]
+    fn folder_category_persists_and_is_independent_per_folder() {
+        let path = temp_container_path("folder_category");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let photo_folder = c.create_folder("Отпуск", ROOT_FOLDER_ID, Some("image")).unwrap();
+        let doc_folder = c.create_folder("Договоры", ROOT_FOLDER_ID, Some("document")).unwrap();
+        let plain_folder = c.create_folder("Разное", ROOT_FOLDER_ID, None).unwrap();
+
+        let get = |c: &Container, id: FileId| -> Option<String> {
+            c.list_dir(ROOT_FOLDER_ID)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.file_id == id)
+                .unwrap()
+                .folder_category
+        };
+        assert_eq!(get(&c, photo_folder), Some("image".to_string()));
+        assert_eq!(get(&c, doc_folder), Some("document".to_string()));
+        assert_eq!(get(&c, plain_folder), None);
+
+        c.close().unwrap();
+        let locked = LockedContainer::open(path_str).unwrap();
+        let reopened = locked.unlock("admin", "adminpassword").unwrap();
+        assert_eq!(get(&reopened, photo_folder), Some("image".to_string()));
+        assert_eq!(get(&reopened, doc_folder), Some("document".to_string()));
+        assert_eq!(get(&reopened, plain_folder), None);
+
+        reopened.close().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1784,7 +1834,7 @@ mod tests {
             Err(CoveError::PermissionDenied)
         ));
         assert!(matches!(
-            viewer.create_folder("x", ROOT_FOLDER_ID),
+            viewer.create_folder("x", ROOT_FOLDER_ID, None),
             Err(CoveError::PermissionDenied)
         ));
 
@@ -1924,8 +1974,8 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
 
-        let outer = c.create_folder("Снаружи", ROOT_FOLDER_ID).unwrap();
-        let inner = c.create_folder("Внутри", outer).unwrap();
+        let outer = c.create_folder("Снаружи", ROOT_FOLDER_ID, None).unwrap();
+        let inner = c.create_folder("Внутри", outer, None).unwrap();
         let src = write_temp_source_file("deep", b"content");
         let deep_id = c.import_file(src.to_str().unwrap(), inner).unwrap();
         let root_src = write_temp_source_file("shallow", b"content");
@@ -1955,8 +2005,8 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
 
-        let outer = c.create_folder("Outer", ROOT_FOLDER_ID).unwrap();
-        let inner = c.create_folder("Inner", outer).unwrap();
+        let outer = c.create_folder("Outer", ROOT_FOLDER_ID, None).unwrap();
+        let inner = c.create_folder("Inner", outer, None).unwrap();
 
         assert!(matches!(
             c.move_file(outer, inner),

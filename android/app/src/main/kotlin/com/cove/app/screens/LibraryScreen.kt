@@ -273,16 +273,20 @@ fun LibraryScreen(
             entries = withContext(Dispatchers.IO) {
                 when (val current = section) {
                     is Section.Root -> container.listDir(currentFolder.id)
-                    // Раньше был плоский search(category=...) без привязки к
-                    // папке — новая папка, созданная во вкладке "Фото", в неё
-                    // не попадала (только в "Библиотеку"). Теперь та же
-                    // навигация по папкам, что и в Root, только с фильтром
-                    // файлов по категории на клиенте — папки показываются
-                    // всегда, независимо от того, что внутри (жалоба
-                    // пользователя: "при создании папки в вкладке фото оно
-                    // не отображается в фото").
+                    // Та же навигация по папкам, что и в Root, с фильтром на
+                    // клиенте. Папки фильтруются по folderCategory — тегу,
+                    // который папка получает один раз при создании (в какой
+                    // вкладке нажали "+", та категория и закрепляется, не
+                    // пересчитывается по содержимому — по прямому запросу
+                    // пользователя: папка, созданная в "Фото", не должна
+                    // "утекать" в "Видео"/"Документы", даже если разово в
+                    // неё попадёт видео). Файлы — по фактическому
+                    // расширению, как и раньше.
                     is Section.Category -> container.listDir(currentFolder.id)
-                        .filter { it.isFolder || categoryOf(it.name) == current.category }
+                        .filter {
+                            (it.isFolder && it.folderCategory == current.category) ||
+                                (!it.isFolder && categoryOf(it.name) == current.category)
+                        }
                     is Section.Favorites -> container.search(SearchQuery(favorite = true))
                 }
             }
@@ -489,9 +493,17 @@ fun LibraryScreen(
                     onDismiss = { showNewFolderDialog = false },
                     onConfirm = { name ->
                         showNewFolderDialog = false
+                        // (section as? Section.Category)?.category — null для
+                        // Root (папка ни к чему не привязана, видна только в
+                        // "Библиотеке") и категория для Category-разделов —
+                        // ровно то, что нужно createFolder() для тега (см.
+                        // FileEntry.folderCategory).
+                        val category = (section as? Section.Category)?.category
                         launchWrite {
                             try {
-                                withContext(Dispatchers.IO) { container.createFolder(name, currentFolder.id) }
+                                withContext(Dispatchers.IO) {
+                                    container.createFolder(name, currentFolder.id, category)
+                                }
                                 refresh()
                             } catch (e: AndroidException) {
                                 error = "Не удалось создать папку: ${e.message}"

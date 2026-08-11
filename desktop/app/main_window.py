@@ -551,17 +551,20 @@ class MainWindow(QMainWindow):
                     name_contains=search_text or None, folder_id=self._current_folder_id()
                 )
             elif self._section_kind == "category" and not search_text:
-                # Раньше был плоский search(category=...) без привязки к
-                # папке — новая папка, созданная во вкладке "Фото", в неё не
-                # попадала (только в "Библиотеку"). Теперь та же навигация по
-                # папкам, что и в root, только с фильтром файлов по категории
-                # на клиенте — папки показываются всегда, независимо от того,
-                # что внутри (жалоба пользователя: "при создании папки в
-                # вкладке фото оно не отображается в фото").
+                # Та же навигация по папкам, что и в root, с фильтром на
+                # клиенте. Папки фильтруются по folder_category — тегу,
+                # который папка получает один раз при создании (в какой
+                # вкладке был нажат "+", та категория и закрепляется, не
+                # пересчитывается по содержимому — по прямому запросу
+                # пользователя: папка, созданная в "Фото", не должна
+                # "утекать" в "Видео"/"Документы", даже если разово в неё
+                # попадёт видео). Файлы — по фактическому расширению, как и
+                # раньше.
                 entries = self._container.list_dir(self._current_folder_id())
                 entries = [
                     e for e in entries
-                    if e.is_folder or file_kind.category_of(e.name) == self._section_extra
+                    if (e.is_folder and e.folder_category == self._section_extra)
+                    or (not e.is_folder and file_kind.category_of(e.name) == self._section_extra)
                 ]
             elif self._section_kind == "category":
                 entries = self._container.search(
@@ -639,7 +642,13 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
         try:
-            self._container.create_folder(name.strip(), self._current_folder_id())
+            # _section_extra — None для "root" (папка ни к чему не
+            # привязана, видна только в "Библиотеке") и категория ("image"
+            # и т.п.) для "category"-разделов — ровно то, что нужно
+            # create_folder() для тега (см. FileEntry.folder_category).
+            self._container.create_folder(
+                name.strip(), self._current_folder_id(), self._section_extra
+            )
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось создать папку: {exc}")
         else:

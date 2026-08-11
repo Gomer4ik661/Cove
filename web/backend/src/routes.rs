@@ -111,6 +111,8 @@ pub struct CreateFolderRequest {
     name: String,
     #[serde(default)]
     parent_id: FileId,
+    #[serde(default)]
+    category: Option<String>,
 }
 
 pub async fn create_folder(
@@ -120,6 +122,7 @@ pub async fn create_folder(
     let id = ask(&session.tx, |reply| Command::CreateFolder {
         name: body.name,
         parent_id: body.parent_id,
+        category: body.category,
         reply,
     })
     .await?;

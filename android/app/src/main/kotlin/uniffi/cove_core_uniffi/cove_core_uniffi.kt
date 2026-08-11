@@ -809,7 +809,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_close_container(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_create_folder(`ptr`: Pointer,`name`: RustBuffer.ByValue,`parentId`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_create_folder(`ptr`: Pointer,`name`: RustBuffer.ByValue,`parentId`: Long,`category`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_current_role(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1079,7 +1079,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_close_container() != 13478.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_create_folder() != 39018.toShort()) {
+    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_create_folder() != 45696.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_current_role() != 7094.toShort()) {
@@ -1536,7 +1536,7 @@ public interface AndroidContainerInterface {
      */
     fun `closeContainer`()
     
-    fun `createFolder`(`name`: kotlin.String, `parentId`: kotlin.ULong): kotlin.ULong
+    fun `createFolder`(`name`: kotlin.String, `parentId`: kotlin.ULong, `category`: kotlin.String?): kotlin.ULong
     
     fun `currentRole`(): Role
     
@@ -1731,12 +1731,12 @@ open class AndroidContainer: Disposable, AutoCloseable, AndroidContainerInterfac
     
 
     
-    @Throws(AndroidException::class)override fun `createFolder`(`name`: kotlin.String, `parentId`: kotlin.ULong): kotlin.ULong {
+    @Throws(AndroidException::class)override fun `createFolder`(`name`: kotlin.String, `parentId`: kotlin.ULong, `category`: kotlin.String?): kotlin.ULong {
             return FfiConverterULong.lift(
     callWithPointer {
     uniffiRustCallWithError(AndroidException) { _status ->
     UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_create_folder(
-        it, FfiConverterString.lower(`name`),FfiConverterULong.lower(`parentId`),_status)
+        it, FfiConverterString.lower(`name`),FfiConverterULong.lower(`parentId`),FfiConverterOptionalString.lower(`category`),_status)
 }
     }
     )
@@ -2400,7 +2400,8 @@ data class FileEntry (
     var `mimeHint`: kotlin.String?, 
     var `trashed`: kotlin.Boolean, 
     var `favorite`: kotlin.Boolean, 
-    var `isFolder`: kotlin.Boolean
+    var `isFolder`: kotlin.Boolean, 
+    var `folderCategory`: kotlin.String?
 ) {
     
     companion object
@@ -2422,6 +2423,7 @@ public object FfiConverterTypeFileEntry: FfiConverterRustBuffer<FileEntry> {
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -2435,7 +2437,8 @@ public object FfiConverterTypeFileEntry: FfiConverterRustBuffer<FileEntry> {
             FfiConverterOptionalString.allocationSize(value.`mimeHint`) +
             FfiConverterBoolean.allocationSize(value.`trashed`) +
             FfiConverterBoolean.allocationSize(value.`favorite`) +
-            FfiConverterBoolean.allocationSize(value.`isFolder`)
+            FfiConverterBoolean.allocationSize(value.`isFolder`) +
+            FfiConverterOptionalString.allocationSize(value.`folderCategory`)
     )
 
     override fun write(value: FileEntry, buf: ByteBuffer) {
@@ -2449,6 +2452,7 @@ public object FfiConverterTypeFileEntry: FfiConverterRustBuffer<FileEntry> {
             FfiConverterBoolean.write(value.`trashed`, buf)
             FfiConverterBoolean.write(value.`favorite`, buf)
             FfiConverterBoolean.write(value.`isFolder`, buf)
+            FfiConverterOptionalString.write(value.`folderCategory`, buf)
     }
 }
 

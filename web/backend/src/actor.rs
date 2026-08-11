@@ -24,6 +24,7 @@ pub struct FileEntryDto {
     pub is_folder: bool,
     pub favorite: bool,
     pub trashed: bool,
+    pub folder_category: Option<String>,
 }
 
 impl From<&cove_core::format::file_table::FileEntry> for FileEntryDto {
@@ -39,6 +40,7 @@ impl From<&cove_core::format::file_table::FileEntry> for FileEntryDto {
             is_folder: e.flags.is_folder,
             favorite: e.flags.favorite,
             trashed: e.flags.trashed,
+            folder_category: e.folder_category.clone(),
         }
     }
 }
@@ -60,6 +62,7 @@ pub enum Command {
     CreateFolder {
         name: String,
         parent_id: FileId,
+        category: Option<String>,
         reply: Reply<FileId>,
     },
     Import {
@@ -145,9 +148,10 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
             Command::CreateFolder {
                 name,
                 parent_id,
+                category,
                 reply,
             } => {
-                let res = container.create_folder(&name, parent_id);
+                let res = container.create_folder(&name, parent_id, category.as_deref());
                 let _ = reply.send(res);
             }
             Command::Import {

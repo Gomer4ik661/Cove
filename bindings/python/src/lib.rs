@@ -78,6 +78,8 @@ struct PyFileEntry {
     favorite: bool,
     #[pyo3(get)]
     is_folder: bool,
+    #[pyo3(get)]
+    folder_category: Option<String>,
 }
 
 impl From<CoreFileEntry> for PyFileEntry {
@@ -93,6 +95,7 @@ impl From<CoreFileEntry> for PyFileEntry {
             trashed: e.flags.trashed,
             favorite: e.flags.favorite,
             is_folder: e.flags.is_folder,
+            folder_category: e.folder_category,
         }
     }
 }
@@ -258,10 +261,10 @@ impl PyContainer {
         self.get()?.export_file(file_id, dest_path).map_err(to_py_err)
     }
 
-    #[pyo3(signature = (name, parent_id=0))]
-    fn create_folder(&mut self, name: &str, parent_id: u64) -> PyResult<u64> {
+    #[pyo3(signature = (name, parent_id=0, category=None))]
+    fn create_folder(&mut self, name: &str, parent_id: u64, category: Option<&str>) -> PyResult<u64> {
         self.get_mut()?
-            .create_folder(name, parent_id)
+            .create_folder(name, parent_id, category)
             .map_err(to_py_err)
     }
 

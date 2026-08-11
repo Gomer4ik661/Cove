@@ -58,6 +58,15 @@ pub struct FileEntry {
     /// Заполнено только у internal-записей (`flags.internal`) — file_id
     /// файла, миниатюрой которого эта запись является (ROADMAP.md Фаза 8).
     pub thumbnail_of: Option<FileId>,
+    /// Заполнено только у папок (`flags.is_folder`) — категория вкладки
+    /// (`"image"`/`"video"`/`"document"`/…), в которой папка была создана.
+    /// По прямому запросу пользователя после Фазы 18: папка "привязывается"
+    /// к категории на момент создания и дальше показывается только в этой
+    /// вкладке-категории + в общей "Библиотеке", независимо от того, что
+    /// потом в неё положат — не пересчитывается по фактическому содержимому.
+    /// `None` — папка создана вне category-раздела (в "Библиотеке"), тогда
+    /// показывается только там, ни в одной category-вкладке.
+    pub folder_category: Option<String>,
 }
 
 fn encode_entry(e: &FileEntry, buf: &mut Vec<u8>) {
@@ -87,6 +96,13 @@ fn encode_entry(e: &FileEntry, buf: &mut Vec<u8>) {
         }
         None => push_u8(buf, 0),
     }
+    match &e.folder_category {
+        Some(c) => {
+            push_u8(buf, 1);
+            push_string(buf, c);
+        }
+        None => push_u8(buf, 0),
+    }
 }
 
 fn decode_entry(r: &mut Reader) -> Result<FileEntry> {
@@ -107,6 +123,8 @@ fn decode_entry(r: &mut Reader) -> Result<FileEntry> {
     let flags = FileFlags::from_u8(r.u8()?);
     let has_thumbnail_of = r.u8()?;
     let thumbnail_of = if has_thumbnail_of == 1 { Some(r.u64()?) } else { None };
+    let has_folder_category = r.u8()?;
+    let folder_category = if has_folder_category == 1 { Some(r.string()?) } else { None };
     Ok(FileEntry {
         file_id,
         parent_id,
@@ -119,6 +137,7 @@ fn decode_entry(r: &mut Reader) -> Result<FileEntry> {
         block_list,
         flags,
         thumbnail_of,
+        folder_category,
     })
 }
 
@@ -238,6 +257,7 @@ mod tests {
                 is_folder: false,
             },
             thumbnail_of: None,
+            folder_category: None,
         }
     }
 
