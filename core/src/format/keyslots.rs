@@ -84,6 +84,45 @@ pub const CAPACITY: usize = 16;
 const STATE_EMPTY: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
 
+// Найдено при саморевью крипто-части (docs/SECURITY_SELF_REVIEW.md):
+// memory_kib/iterations/parallelism лежат в keyslot ДО аутентификации
+// (нужны, чтобы вообще запустить Argon2id и получить KEK) и защищены
+// только BLAKE3-checksum'ом слота, который атакующий с доступом на запись
+// к файлу волен пересчитать под любые значения — та же природа, что и три
+// уязвимости из Фазы 17 (заявленная длина/счётчик используется до
+// аутентификации). Без верхней границы подделанный слот мог бы указать
+// memory_kib в единицы-десятки ГиБ (Argon2-крейт такие значения технически
+// принимает) — жертва получила бы OOM/зависание на СВОЁМ собственном
+// устройстве при попытке войти в СВОЙ же аккаунт, ещё до проверки пароля.
+// Пределы — щедрый (десятикратный) запас над самым тяжёлым, что
+// приложение когда-либо само выставляет (`KdfParams::default()` = 19 МиБ
+// / 2 итерации / 1 поток). Проверяется и на записи (serialize_slot), и на
+// чтении (parse_slot) — на записи это просто defence-in-depth (сегодня
+// единственный источник kdf_params — `KdfParams::default()`), на чтении
+// это и есть реальная защита от подделанного файла.
+const MAX_MEMORY_KIB: u32 = 256 * 1024; // 256 МиБ
+const MAX_ITERATIONS: u32 = 64;
+const MAX_PARALLELISM: u32 = 16;
+
+fn check_kdf_params_bounds(params: &kdf::KdfParams) -> Result<()> {
+    if params.memory_kib == 0 || params.memory_kib > MAX_MEMORY_KIB {
+        return Err(CoveError::FormatError {
+            detail: format!("keyslot kdf memory_kib out of bounds: {}", params.memory_kib),
+        });
+    }
+    if params.iterations == 0 || params.iterations > MAX_ITERATIONS {
+        return Err(CoveError::FormatError {
+            detail: format!("keyslot kdf iterations out of bounds: {}", params.iterations),
+        });
+    }
+    if params.parallelism == 0 || params.parallelism > MAX_PARALLELISM {
+        return Err(CoveError::FormatError {
+            detail: format!("keyslot kdf parallelism out of bounds: {}", params.parallelism),
+        });
+    }
+    Ok(())
+}
+
 /// Пустой слот на диске — используется при удалении пользователя
 /// (точечная перезапись, см. container::Container::remove_user).
 pub const EMPTY_SLOT: [u8; SLOT_LEN] = [0u8; SLOT_LEN];
@@ -100,6 +139,7 @@ pub(crate) fn serialize_slot(slot: &Keyslot) -> Result<[u8; SLOT_LEN]> {
             detail: "unexpected wrapped DEK length".into(),
         });
     }
+    check_kdf_params_bounds(&slot.kdf_params)?;
 
     let mut buf = [0u8; SLOT_LEN];
     let mut pos = 0;
@@ -165,6 +205,12 @@ fn parse_slot(buf: &[u8; SLOT_LEN]) -> Result<Option<Keyslot>> {
     pos += 4;
     let parallelism = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
     pos += 4;
+    let kdf_params = kdf::KdfParams {
+        memory_kib,
+        iterations,
+        parallelism,
+    };
+    check_kdf_params_bounds(&kdf_params)?;
     let nonce: [u8; aead::NONCE_LEN] = buf[pos..pos + aead::NONCE_LEN].try_into().unwrap();
     pos += aead::NONCE_LEN;
     let ciphertext = buf[pos..pos + WRAPPED_CIPHERTEXT_LEN].to_vec();
@@ -174,11 +220,7 @@ fn parse_slot(buf: &[u8; SLOT_LEN]) -> Result<Option<Keyslot>> {
         username,
         role,
         kdf_salt,
-        kdf_params: kdf::KdfParams {
-            memory_kib,
-            iterations,
-            parallelism,
-        },
+        kdf_params,
         wrapped_dek: WrappedDek { ciphertext, nonce },
     }))
 }
@@ -263,5 +305,32 @@ mod tests {
         let mut corrupted = region;
         corrupted[10] ^= 0xFF;
         assert!(parse_region(&corrupted).is_err());
+    }
+
+    /// Найдено при саморевью крипто-части (docs/SECURITY_SELF_REVIEW.md):
+    /// memory_kib защищён только BLAKE3-checksum'ом слота, который
+    /// атакующий с доступом на запись к файлу волен пересчитать под любое
+    /// значение — этот тест воспроизводит именно такую подделку (меняет
+    /// поле И пересчитывает checksum, как реально сделал бы атакующий, а
+    /// не просто портит случайный байт, как slot_corruption_detected
+    /// выше) и проверяет, что заявленно огромный memory_kib отклоняется
+    /// ДО попытки запустить на нём Argon2id.
+    #[test]
+    fn forged_huge_kdf_memory_kib_rejected_not_oom() {
+        let mut slot = serialize_slot(&sample_slot("admin")).unwrap();
+
+        let memory_kib_offset = 1 + 1 + 1 + 1 + USERNAME_CAP + kdf::SALT_LEN;
+        let huge: u32 = 8 * 1024 * 1024; // 8 ГиБ — валидно для argon2-крейта, но абсурдно дорого
+        slot[memory_kib_offset..memory_kib_offset + 4].copy_from_slice(&huge.to_le_bytes());
+
+        // Пересчитываем checksum под подделанные байты — именно так это
+        // сделал бы атакующий с доступом на запись к файлу, а не просто
+        // испортил бы случайный байт (что ловит уже существующий
+        // slot_corruption_detected).
+        let checksum_at = SLOT_LEN - 32;
+        let checksum = blake3::hash(&slot[0..checksum_at]);
+        slot[checksum_at..SLOT_LEN].copy_from_slice(&checksum.as_bytes()[..]);
+
+        assert!(parse_slot(&slot).is_err());
     }
 }

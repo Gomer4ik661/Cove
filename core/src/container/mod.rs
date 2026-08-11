@@ -95,13 +95,30 @@ impl LockedContainer {
         // Намеренно одна и та же ошибка что при неверном пароле — не даём
         // enumerate пользователей по разнице в ответе (THREAT_MODEL.md §2.1,
         // ARCHITECTURE.md §3).
-        let slot = self
+        //
+        // Найдено при саморевью крипто-части (docs/SECURITY_SELF_REVIEW.md):
+        // одинаковое СОДЕРЖИМОЕ ошибки не значит одинаковое ВРЕМЯ ответа.
+        // При существующем username путь ниже прогоняет Argon2id (осознанно
+        // ~100мс+, FORMAT.md §3), при несуществующем — раньше возвращал
+        // AuthFailed мгновенно, до Argon2id. Для Web-бэкона
+        // (THREAT_MODEL.md §2.4, самая широкая поверхность атаки в
+        // проекте) это готовый timing-oracle для перечисления валидных
+        // username по задержке ответа, даже когда текст ошибки одинаковый.
+        // Прогоняем ту же по стоимости Argon2id-операцию и на "не найден",
+        // чтобы оба пути стоили сопоставимо по времени.
+        match self
             .keyslots
             .iter()
             .flatten()
             .find(|s| s.slot_type == SlotType::User && s.username == username)
-            .ok_or(CoveError::AuthFailed)?;
-        self.unlock_slot(slot, password.as_bytes(), username)
+        {
+            Some(slot) => self.unlock_slot(slot, password.as_bytes(), username),
+            None => {
+                let dummy_salt = [0u8; kdf::SALT_LEN];
+                let _ = kdf::derive_kek(password.as_bytes(), &dummy_salt, kdf::KdfParams::default());
+                Err(CoveError::AuthFailed)
+            }
+        }
     }
 
     pub fn unlock_with_recovery(&self, phrase: &str) -> Result<Container> {
@@ -533,7 +550,18 @@ impl Container {
     /// файле-контейнере. Сначала читается фиксированный заголовок (в нём —
     /// длина plaintext), затем ровно столько шифртекста, сколько нужно —
     /// без знания длины блока заранее (FORMAT.md §6).
-    fn read_block_at(&self, file: &mut File, offset: u64) -> Result<Vec<u8>> {
+    /// `expected_file_id`/`expected_block_index` — координаты, которым
+    /// вызывающая сторона доверяет (из File Table и позиции в
+    /// `block_list`), используются для проверки AAD в `decode_block` —
+    /// см. `format::data_blocks` и docs/SECURITY_SELF_REVIEW.md
+    /// (защита от подмены/перестановки блоков между файлами).
+    fn read_block_at(
+        &self,
+        file: &mut File,
+        offset: u64,
+        expected_file_id: FileId,
+        expected_block_index: u32,
+    ) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(offset))?;
         let mut header_buf = [0u8; data_blocks::HEADER_LEN];
         file.read_exact(&mut header_buf)?;
@@ -559,7 +587,7 @@ impl Container {
         let mut full = Vec::with_capacity(header_buf.len() + rest.len());
         full.extend_from_slice(&header_buf);
         full.extend_from_slice(&rest);
-        data_blocks::decode_block(&full, &self.session.dek)
+        data_blocks::decode_block(&full, &self.session.dek, expected_file_id, expected_block_index)
     }
 
     /// Общая логика чанкирования+шифрования+записи, используемая и
@@ -786,8 +814,9 @@ impl Container {
 
         let mut container_file = File::open(&self.path)?;
         let mut out = File::create(dest_path)?;
-        for &offset in &entry.block_list {
-            let plaintext = self.read_block_at(&mut container_file, offset)?;
+        for (block_index, &offset) in entry.block_list.iter().enumerate() {
+            let plaintext =
+                self.read_block_at(&mut container_file, offset, entry.file_id, block_index as u32)?;
             out.write_all(&plaintext)?;
         }
         out.sync_all()?;
@@ -935,7 +964,12 @@ impl Container {
             let Some(&block_offset) = entry.block_list.get(block_idx) else {
                 break;
             };
-            let plaintext = self.read_block_at(&mut container_file, block_offset)?;
+            let plaintext = self.read_block_at(
+                &mut container_file,
+                block_offset,
+                entry.file_id,
+                block_idx as u32,
+            )?;
             let in_block_offset = (cursor % block_size) as usize;
             let take = plaintext
                 .len()
@@ -1388,6 +1422,61 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&src);
+    }
+
+    /// Найдено при саморевью крипто-части (docs/SECURITY_SELF_REVIEW.md):
+    /// сквозной тест на реальном файле-контейнере, не только на уровне
+    /// `format::data_blocks` — физически подменяет байты блока одного
+    /// файла байтами блока другого (ровно то, что мог бы сделать
+    /// атакующий с доступом на запись к `.slr`, но без пароля), как это
+    /// уже делают предыдущие Фаза-17 тесты для других полей. До AAD-
+    /// привязки `read_at()` на файл B тут вернул бы `Ok(содержимое файла
+    /// A)` — тег AEAD оставался валиден, потому что ключ общий на весь
+    /// контейнер, а nonce+ciphertext просто "переехали" на новое место
+    /// целиком. Теперь обязан провалиться явной ошибкой.
+    #[test]
+    fn block_swapped_between_files_on_disk_rejected() {
+        let path = temp_container_path("block_swap");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _recovery) = Container::create(path_str, "admin", "pw12345678").unwrap();
+
+        // Одинаковая ДЛИНА содержимого — важно, чтобы блоки А и Б занимали
+        // на диске одинаковое число байт и подмену можно было сделать
+        // простым copy_from_slice того же диапазона.
+        let src_a = write_temp_source_file("swap_a", b"AAAAAAAAAAA");
+        let src_b = write_temp_source_file("swap_b", b"BBBBBBBBBBB");
+        let file_a = c.import_file(src_a.to_str().unwrap(), ROOT_FOLDER_ID).unwrap();
+        let file_b = c.import_file(src_b.to_str().unwrap(), ROOT_FOLDER_ID).unwrap();
+        let entries = c.list_dir(ROOT_FOLDER_ID).unwrap();
+        let offset_a = entries.iter().find(|e| e.file_id == file_a).unwrap().block_list[0];
+        let offset_b = entries.iter().find(|e| e.file_id == file_b).unwrap().block_list[0];
+        c.close().unwrap();
+
+        let block_len = data_blocks::total_len(11);
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(path_str).unwrap();
+            f.seek(SeekFrom::Start(offset_a)).unwrap();
+            let mut block_a_bytes = vec![0u8; block_len];
+            f.read_exact(&mut block_a_bytes).unwrap();
+
+            // Физически переносим байты блока А на позицию блока Б —
+            // это и есть "атакующий с доступом на запись к файлу".
+            f.seek(SeekFrom::Start(offset_b)).unwrap();
+            f.write_all(&block_a_bytes).unwrap();
+        }
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let unlocked = locked.unlock("admin", "pw12345678").unwrap();
+
+        // Файл А по-прежнему корректно читается (его собственный блок не
+        // трогали, только скопировали ИЗ него).
+        assert_eq!(unlocked.read_at(file_a, 0, 11).unwrap(), b"AAAAAAAAAAA");
+        // Файл Б обязан провалиться — НЕ вернуть подменённое "AAAAAAAAAAA".
+        assert!(unlocked.read_at(file_b, 0, 11).is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&src_a);
+        let _ = std::fs::remove_file(&src_b);
     }
 
     #[test]

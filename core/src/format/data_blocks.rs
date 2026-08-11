@@ -36,11 +36,34 @@ pub fn total_len(plaintext_len: u32) -> usize {
     HEADER_LEN + plaintext_len as usize + aead::TAG_LEN
 }
 
+/// `file_id`+`block_index` как Associated Data — найдено при саморевью
+/// крипто-части (docs/SECURITY_SELF_REVIEW.md): ключ шифрования (HKDF-
+/// подключ `DATA_BLOCKS`) один на ВЕСЬ контейнер, общий для блоков всех
+/// файлов. Без AAD, привязывающего ciphertext к конкретной (file_id,
+/// block_index) позиции, AEAD-тег авторизует только "этот шифртекст был
+/// запечатан под этим ключом с этим nonce" — но НЕ "этот шифртекст
+/// принадлежит именно этому файлу и именно этой позиции в нём". Кто-то с
+/// доступом на запись к файлу-контейнеру (без пароля) мог физически
+/// переставить байты одного валидного блока на место другого (между
+/// файлами или внутри одного файла) — тег остаётся валидным (это тот же
+/// самый (key, nonce, ciphertext, tag), просто в другом месте на диске), и
+/// при чтении жертва молча получила бы чужой расшифрованный контент вместо
+/// ожидаемого, без единой ошибки. `content_hash` в File Table (BLAKE3
+/// всего файла) на чтение НЕ проверяется — тоже не ловит такую подмену.
+fn block_aad(file_id: FileId, block_index: u32) -> [u8; 12] {
+    let mut aad = [0u8; 12];
+    aad[0..8].copy_from_slice(&file_id.to_le_bytes());
+    aad[8..12].copy_from_slice(&block_index.to_le_bytes());
+    aad
+}
+
 /// Кодирует один блок целиком, готовый к записи на диск как есть.
 pub fn encode_block(file_id: FileId, block_index: u32, plaintext: &[u8], dek: &keys::Dek) -> Vec<u8> {
     let key = dek.subkey(keys::domain::DATA_BLOCKS);
     let nonce = aead::random_nonce();
-    let ciphertext = aead::seal(&key, &nonce, plaintext).expect("seal never fails here");
+    let aad = block_aad(file_id, block_index);
+    let ciphertext =
+        aead::seal_aad(&key, &nonce, plaintext, &aad).expect("seal never fails here");
 
     let mut bytes = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     bytes.extend_from_slice(&file_id.to_le_bytes());
@@ -52,7 +75,20 @@ pub fn encode_block(file_id: FileId, block_index: u32, plaintext: &[u8], dek: &k
 }
 
 /// Декодирует блок из его полных байт на диске (header + ciphertext).
-pub fn decode_block(full_bytes: &[u8], dek: &keys::Dek) -> Result<Vec<u8>> {
+///
+/// `expected_file_id`/`expected_block_index` — ОБЯЗАНЫ приходить от
+/// вызывающей стороны (из File Table и позиции в `block_list`, которым
+/// доверяем — сама File Table целиком под AEAD), а НЕ из
+/// `file_id`/`block_index`, прочитанных здесь же из заголовка блока: эти
+/// поля лежат в открытом виде на диске и ничем не защищены (см.
+/// `block_aad`) — использовать их для построения AAD, который тут же
+/// сверяется, было бы бессмысленно (подмена подделывает оба поля разом).
+pub fn decode_block(
+    full_bytes: &[u8],
+    dek: &keys::Dek,
+    expected_file_id: FileId,
+    expected_block_index: u32,
+) -> Result<Vec<u8>> {
     if full_bytes.len() < HEADER_LEN {
         return Err(CoveError::FormatError {
             detail: "data block too short".into(),
@@ -63,7 +99,8 @@ pub fn decode_block(full_bytes: &[u8], dek: &keys::Dek) -> Result<Vec<u8>> {
     let ciphertext = &full_bytes[HEADER_LEN..];
 
     let key = dek.subkey(keys::domain::DATA_BLOCKS);
-    aead::open(&key, &header.nonce, ciphertext)
+    let aad = block_aad(expected_file_id, expected_block_index);
+    aead::open_aad(&key, &header.nonce, ciphertext, &aad)
 }
 
 #[cfg(test)]
@@ -84,7 +121,7 @@ mod tests {
         assert_eq!(header.block_index, 2);
         assert_eq!(header.plaintext_len, plaintext.len() as u32);
 
-        let decoded = decode_block(&bytes, &dek).unwrap();
+        let decoded = decode_block(&bytes, &dek, 7, 2).unwrap();
         assert_eq!(decoded, plaintext);
     }
 
@@ -93,6 +130,31 @@ mod tests {
         let dek = Dek::generate();
         let other = Dek::generate();
         let bytes = encode_block(1, 0, b"secret", &dek);
-        assert!(decode_block(&bytes, &other).is_err());
+        assert!(decode_block(&bytes, &other, 1, 0).is_err());
+    }
+
+    /// Найдено при саморевью крипто-части (docs/SECURITY_SELF_REVIEW.md):
+    /// до AAD-привязки этот же блок расшифровался бы УСПЕШНО под любой
+    /// (file_id, block_index), потому что ключ общий на весь контейнер и
+    /// nonce+ciphertext переезжают вместе как единое целое — то есть
+    /// подмену/перестановку блоков между файлами AEAD-тег сам по себе не
+    /// ловил. Теперь тот же валидный блок, прочитанный с ЧУЖИМ ожидаемым
+    /// file_id/block_index (как было бы при физической подмене байт на
+    /// диске), обязан провалиться.
+    #[test]
+    fn block_spliced_to_different_position_rejected() {
+        let dek = Dek::generate();
+        let bytes = encode_block(1, 0, b"secret of file 1", &dek);
+
+        // Тот же самый файл, но "подъехавший" на позицию другого блока.
+        assert!(decode_block(&bytes, &dek, 1, 1).is_err());
+        // Другой файл целиком (классическая подмена: взять чужой валидный
+        // блок и подставить вместо своего).
+        assert!(decode_block(&bytes, &dek, 2, 0).is_err());
+
+        // Контрольная проверка: с правильными координатами тот же блок
+        // по-прежнему читается — это не "всё стало отклоняться", а именно
+        // точечная привязка к позиции.
+        assert!(decode_block(&bytes, &dek, 1, 0).is_ok());
     }
 }

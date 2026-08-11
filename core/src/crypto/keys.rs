@@ -6,7 +6,7 @@ use crate::error::{CoveError, Result};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroizing, ZeroizeOnDrop};
 
 pub const DEK_LEN: usize = 32;
 
@@ -39,10 +39,16 @@ impl Dek {
     /// Подключ под конкретный домен использования (File Table / индекс /
     /// блоки данных / superblock) — FORMAT.md §0.3. Домены-строки — из
     /// FORMAT.md, менять их означает менять формат, а не просто код.
-    pub fn subkey(&self, domain: &str) -> [u8; 32] {
+    ///
+    /// `Zeroizing<[u8; 32]>`, не голый массив — найдено при саморевью
+    /// крипто-части (docs/SECURITY_SELF_REVIEW.md): это тот самый ключ,
+    /// которым `aead::seal`/`open` шифрует каждую страницу File Table,
+    /// каждый блок данных и т.д. — вызывается на каждую операцию, а раньше
+    /// ничем не зачищался по выходу из скоупа, в отличие от самого `Dek`.
+    pub fn subkey(&self, domain: &str) -> Zeroizing<[u8; 32]> {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
-        let mut out = [0u8; 32];
-        hk.expand(domain.as_bytes(), &mut out)
+        let mut out = Zeroizing::new([0u8; 32]);
+        hk.expand(domain.as_bytes(), &mut *out)
             .expect("32 bytes is a valid HKDF-SHA256 output length");
         out
     }
