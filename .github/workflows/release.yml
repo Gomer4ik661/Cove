@@ -34,11 +34,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: venv + PySide6 + PyInstaller
+      - name: venv + зависимости из requirements.txt + PyInstaller
         run: |
           python3 -m venv desktop/.venv
           desktop/.venv/bin/pip install --upgrade pip
-          desktop/.venv/bin/pip install PySide6 pyinstaller
+          desktop/.venv/bin/pip install -r desktop/requirements.txt pyinstaller
 
       - name: PyInstaller (desktop/cove.spec)
         working-directory: desktop
@@ -85,12 +85,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: venv + PySide6 + PyInstaller
+      - name: venv + зависимости из requirements.txt + PyInstaller
         shell: pwsh
         run: |
           python -m venv desktop\.venv
           desktop\.venv\Scripts\pip install --upgrade pip
-          desktop\.venv\Scripts\pip install PySide6 pyinstaller
+          desktop\.venv\Scripts\pip install -r desktop\requirements.txt pyinstaller
 
       - name: PyInstaller (desktop/cove.spec)
         working-directory: desktop

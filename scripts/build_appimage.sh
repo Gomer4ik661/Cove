@@ -21,11 +21,15 @@ echo "== 1/4: cove_core_py.so =="
 ./scripts/build_python_bindings.sh
 
 echo "== 2/4: PyInstaller onefile =="
+# requirements.txt, а не хардкод "PySide6 pyinstaller" — иначе новые
+# рантайм-зависимости (например, cryptography для механизма обновлений,
+# Фаза 18) молча не попадали бы в свежий .venv при пересборке с нуля;
+# нашлось вживую при первой реальной AppImage-сборке после их добавления.
 if [[ ! -d "$DESKTOP_DIR/.venv" ]]; then
     python3 -m venv "$DESKTOP_DIR/.venv"
-    "$DESKTOP_DIR/.venv/bin/pip" install --upgrade pip -q
-    "$DESKTOP_DIR/.venv/bin/pip" install -q PySide6 pyinstaller
 fi
+"$DESKTOP_DIR/.venv/bin/pip" install --upgrade pip -q
+"$DESKTOP_DIR/.venv/bin/pip" install -q -r "$DESKTOP_DIR/requirements.txt" pyinstaller
 rm -rf "$DESKTOP_DIR/build" "$DESKTOP_DIR/dist"
 (cd "$DESKTOP_DIR" && .venv/bin/pyinstaller --noconfirm cove.spec)
 
