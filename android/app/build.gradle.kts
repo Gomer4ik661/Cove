@@ -65,6 +65,10 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.VERSION_NAME — источник текущей версии для
+        // UpdateChecker (ROADMAP.md Фаза 18), чтобы не дублировать
+        // versionName ещё и в Kotlin-константе.
+        buildConfig = true
     }
 
     // Собранные под Android .so из bindings/android (Фаза 14, ROADMAP.md)
@@ -105,4 +109,20 @@ dependencies {
     // доработка после того как обнаружился пробел с просмотрщиками).
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
+
+    // Ed25519-проверка подписи release-manifest.json (ROADMAP.md Фаза 18,
+    // "механизм обновлений с проверкой подписи") — нативная поддержка
+    // Ed25519 (java.security "EdDSA"/NamedParameterSpec) появилась только
+    // в API 33, а minSdk здесь 24, поэтому нужна сторонняя реализация.
+    // BouncyCastle — стандартный, широко аудированный выбор для этого.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+
+    // Local unit tests (src/test/, JVM, без эмулятора) для UpdateChecker —
+    // org.json в проде приходит из android.jar (на голой JVM это заглушка,
+    // кидающая "Stub!"), поэтому для тестов нужна настоящая реализация с
+    // тем же API. BouncyCastle тестам отдельная зависимость не нужна —
+    // bcprov-jdk18on уже чистая Java-библиотека, тот же jar работает и в
+    // unit-тестах, и на устройстве.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

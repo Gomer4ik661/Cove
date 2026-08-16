@@ -1,5 +1,7 @@
 import socket
+import webbrowser
 
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from . import autostart
 from . import config as config_module
+from . import update_check
 
 DEFAULT_WEB_PORT = 8443
 
@@ -38,6 +41,26 @@ LANGUAGE_OPTIONS = [
 ]
 
 
+class _UpdateCheckWorker(QThread):
+    """Сетевой запрос (GitHub API + скачивание манифеста) не должен висеть
+    на UI-потоке — при зависшем DNS/медленной сети диалог настроек иначе
+    замирал бы на весь _REQUEST_TIMEOUT_S (10с) без возможности даже
+    нажать "Отмена". Не трогает Container — чисто сеть, поэтому обычные
+    правила "PyO3-объект не для параллельных вызовов" (Фаза 8) тут ни при
+    чём, отдельный поток безопасен."""
+
+    finished_ok = Signal(object)  # update_check.UpdateResult
+    finished_error = Signal(str)
+
+    def run(self) -> None:
+        try:
+            result = update_check.check_for_updates()
+        except update_check.UpdateCheckError as e:
+            self.finished_error.emit(str(e))
+        else:
+            self.finished_ok.emit(result)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: dict, parent=None, web_server=None, container_path: str | None = None):
         super().__init__(parent)
@@ -47,10 +70,13 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Настройки")
         self.setMinimumWidth(380)
 
+        self._update_thread: _UpdateCheckWorker | None = None
+
         tabs = QTabWidget()
         tabs.addTab(self._build_general_tab(settings), "Общие")
         tabs.addTab(self._build_security_tab(settings), "Безопасность")
         tabs.addTab(self._build_web_tab(settings), "Веб")
+        tabs.addTab(self._build_updates_tab(), "Обновления")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -199,6 +225,83 @@ class SettingsDialog(QDialog):
                 self._web_status_label.setText(f"Ошибка: {error}")
                 return
         self._refresh_web_status()
+
+    def _build_updates_tab(self) -> QWidget:
+        info = QLabel(
+            f"Текущая версия: {update_check.CURRENT_VERSION}\n\n"
+            "Проверка обновлений скачивает только небольшой подписанный "
+            "манифест версии (не сам установочный файл) и проверяет его "
+            "Ed25519-подпись — сама установка всегда остаётся ручной."
+        )
+        info.setWordWrap(True)
+
+        self._update_status_label = QLabel("")
+        self._update_status_label.setWordWrap(True)
+
+        self._update_check_btn = QPushButton("Проверить обновления")
+        self._update_check_btn.clicked.connect(self._start_update_check)
+
+        self._update_open_btn = QPushButton("Открыть страницу релиза")
+        self._update_open_btn.setVisible(False)
+        self._update_open_btn.clicked.connect(self._open_release_page)
+        self._pending_release_url: str | None = None
+
+        form = QFormLayout()
+        form.addRow(info)
+        form.addRow("", self._update_check_btn)
+        form.addRow("Статус:", self._update_status_label)
+        form.addRow("", self._update_open_btn)
+
+        widget = QWidget()
+        widget.setLayout(form)
+        return widget
+
+    def _start_update_check(self) -> None:
+        if self._update_thread is not None:
+            return  # уже идёт проверка — не запускаем вторую поверх
+        self._update_check_btn.setEnabled(False)
+        self._update_open_btn.setVisible(False)
+        self._update_status_label.setText("Проверка…")
+
+        self._update_thread = _UpdateCheckWorker(self)
+        self._update_thread.finished_ok.connect(self._on_update_check_ok)
+        self._update_thread.finished_error.connect(self._on_update_check_error)
+        self._update_thread.finished.connect(self._on_update_thread_finished)
+        self._update_thread.start()
+
+    def _on_update_check_ok(self, result) -> None:
+        if result.update_available:
+            self._update_status_label.setText(
+                f"Доступна новая версия: {result.latest_version} "
+                f"(у вас {update_check.CURRENT_VERSION})"
+            )
+            self._pending_release_url = result.release_url
+            self._update_open_btn.setVisible(True)
+        else:
+            self._update_status_label.setText("У вас последняя версия.")
+
+    def _on_update_check_error(self, message: str) -> None:
+        self._update_status_label.setText(f"Не удалось проверить: {message}")
+
+    def _on_update_thread_finished(self) -> None:
+        self._update_check_btn.setEnabled(True)
+        self._update_thread = None
+
+    def _open_release_page(self) -> None:
+        if self._pending_release_url:
+            webbrowser.open(self._pending_release_url)
+
+    def closeEvent(self, event) -> None:
+        # QThread не должен быть уничтожен, пока ещё выполняется — иначе
+        # Qt честно ругается в консоль ("QThread: Destroyed while thread
+        # is still running") и в худшем случае это UB. Проверка сети
+        # короткая (_REQUEST_TIMEOUT_S=10с в update_check.py), подождать
+        # не страшно — это не блокировка основного окна приложения, только
+        # закрытия уже открытого диалога настроек.
+        if self._update_thread is not None:
+            self._update_thread.quit()
+            self._update_thread.wait()
+        super().closeEvent(event)
 
     @staticmethod
     def _local_lan_address() -> str:

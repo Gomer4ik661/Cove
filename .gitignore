@@ -49,3 +49,10 @@ dist/
 /desktop/packaging/appimagetool-*.AppImage
 /desktop/packaging/AppDir/
 *.AppImage
+
+# Приватный Ed25519-ключ подписи релизов (Фаза 18, механизм обновлений) —
+# реальный release-signing-key.pem сюда попадает, .example — обычный текст-
+# заглушка с инструкцией, не .pem, поэтому не нужен отдельный !negate.
+# Публичный ключ (не секрет) встроен в desktop/app/update_check.py и
+# android/.../UpdateChecker.kt — см. release-signing-key.pem.example.
+release-signing-key.pem

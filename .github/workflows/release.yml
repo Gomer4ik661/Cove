@@ -163,13 +163,65 @@ jobs:
           name: cove-android-release
           path: android/app/build/outputs/apk/release/app-release.apk
 
-  publish-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  sign-release:
+    # Фаза 18 (ROADMAP.md) — механизм обновлений с проверкой подписи.
+    # release-manifest.json (версия + sha256 каждого артефакта) подписан
+    # Ed25519-ключом — desktop/app/update_check.py и Android
+    # UpdateChecker.kt проверяют эту подпись встроенным публичным ключом
+    # перед тем, как доверять номеру версии из GitHub API (не только
+    # HTTPS-транспорту до api.github.com). scripts/sign_release.py и
+    # release-signing-key.pem.example — инструкция по генерации ключа и
+    # прописыванию секрета RELEASE_SIGNING_KEY.
     needs: [linux-desktop, windows-desktop, android]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-      - name: GitHub Release с артефактами трёх платформ
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: pip install cryptography
+        run: pip install --quiet cryptography
+
+      - name: версия релиза (из тега, иначе из Cargo.toml для workflow_dispatch)
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: приватный ключ из GitHub Secret
+        run: echo "${{ secrets.RELEASE_SIGNING_KEY }}" > release-signing-key.pem
+
+      - name: sign_release.py
+        run: |
+          python3 scripts/sign_release.py \
+            --version "${{ steps.version.outputs.value }}" \
+            --key release-signing-key.pem \
+            --out-dir signed-manifest \
+            --asset linux-binary=cove-linux/Cove \
+            --asset linux-appimage=cove-linux-appimage/Cove-x86_64.AppImage \
+            --asset windows=cove-windows-unsigned/Cove.exe \
+            --asset android=cove-android-release/app-release.apk
+          rm -f release-signing-key.pem
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: signed-manifest/
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-desktop, windows-desktop, android, sign-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: GitHub Release с артефактами трёх платформ + подписанным манифестом
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -178,3 +230,5 @@ jobs:
             cove-linux-appimage/Cove-x86_64.AppImage
             cove-windows-unsigned/Cove.exe
             cove-android-release/app-release.apk
+            release-manifest/release-manifest.json
+            release-manifest/release-manifest.json.sig

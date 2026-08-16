@@ -1,6 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- Проверка обновлений (ROADMAP.md Фаза 18) — единственная причина
+         исходящих сетевых запросов из Android-приложения: GitHub Releases
+         API + скачивание небольшого подписанного манифеста версии, см.
+         update/UpdateChecker.kt. Сам контейнер .slr по сети никогда не
+         уходит (кроме опционального Web-доступа с Desktop — это Фаза 13,
+         отдельная функциональность на другой платформе). -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="Cove"

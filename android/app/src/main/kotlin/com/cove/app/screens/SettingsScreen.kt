@@ -1,5 +1,7 @@
 package com.cove.app.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,13 +22,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.cove.app.BuildConfig
 import com.cove.app.security.BiometricVault
 import com.cove.app.storage.ThemeMode
+import com.cove.app.update.UpdateChecker
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -39,6 +45,11 @@ fun SettingsScreen(
     val context = LocalContext.current
     val vault = remember { BiometricVault(context) }
     var biometricEnrolled by remember { mutableStateOf(vault.hasSavedCredentials(containerPath)) }
+
+    val scope = rememberCoroutineScope()
+    var updateStatus by remember { mutableStateOf<String?>(null) }
+    var updateChecking by remember { mutableStateOf(false) }
+    var releaseUrl by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -78,6 +89,54 @@ fun SettingsScreen(
                     "Биометрия для этого хранилища не настроена — включить её можно на экране входа при следующем ручном входе паролем.",
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+
+            HorizontalDivider()
+
+            Text(
+                "Обновления",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+            )
+            Text(
+                "Текущая версия: ${BuildConfig.VERSION_NAME}",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+            OutlinedButton(
+                enabled = !updateChecking,
+                onClick = {
+                    updateChecking = true
+                    updateStatus = "Проверка…"
+                    releaseUrl = null
+                    scope.launch {
+                        try {
+                            val result = UpdateChecker.checkForUpdates(BuildConfig.VERSION_NAME)
+                            updateStatus = if (result.updateAvailable) {
+                                releaseUrl = result.releaseUrl
+                                "Доступна новая версия: ${result.latestVersion} (у вас ${BuildConfig.VERSION_NAME})"
+                            } else {
+                                "У вас последняя версия."
+                            }
+                        } catch (e: UpdateChecker.UpdateCheckException) {
+                            updateStatus = "Не удалось проверить: ${e.message}"
+                        } finally {
+                            updateChecking = false
+                        }
+                    }
+                },
+            ) { Text("Проверить обновления") }
+            updateStatus?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+            releaseUrl?.let { url ->
+                TextButton(onClick = {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                }) { Text("Открыть страницу релиза") }
             }
         }
     }
