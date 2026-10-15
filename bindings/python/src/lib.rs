@@ -18,6 +18,12 @@ pyo3::create_exception!(cove_core_py, CoveIoError, PyException);
 pyo3::create_exception!(cove_core_py, CoveNotFoundError, PyException);
 pyo3::create_exception!(cove_core_py, CoveAlreadyExistsError, PyException);
 pyo3::create_exception!(cove_core_py, CovePermissionError, PyException);
+// Другая одновременно открытая сессия того же контейнера уже закоммитила
+// изменения после того, как эта сессия последний раз синхронизировалась —
+// см. cove_core::CoveError::Conflict. GUI должен предложить пользователю
+// перезайти, а не тихо проигнорировать (или, того хуже, повторить commit()
+// вслепую — это как раз то, от чего защищает эта ошибка).
+pyo3::create_exception!(cove_core_py, CoveConflictError, PyException);
 
 fn to_py_err(e: cove_core::CoveError) -> PyErr {
     let msg = e.to_string();
@@ -28,6 +34,7 @@ fn to_py_err(e: cove_core::CoveError) -> PyErr {
         ErrorCategory::NotFound => CoveNotFoundError::new_err(msg),
         ErrorCategory::AlreadyExists => CoveAlreadyExistsError::new_err(msg),
         ErrorCategory::PermissionDenied => CovePermissionError::new_err(msg),
+        ErrorCategory::Conflict => CoveConflictError::new_err(msg),
     }
 }
 
@@ -336,6 +343,44 @@ impl PyContainer {
             None => Ok(()),
         }
     }
+
+    /// Пишет текущее состояние на диск, не закрывая контейнер — по прямому
+    /// запросу пользователя: раньше изменения были видны другой открытой
+    /// сессии (например, веб-версии, пока открыт Desktop) только после
+    /// полного close(). GUI зовёт это после каждого пользовательского
+    /// действия (main_window.py), не после каждого файла в batch-импорте.
+    fn commit(&mut self) -> PyResult<()> {
+        self.get_mut()?.commit().map_err(to_py_err)
+    }
+
+    /// Перечитывает File Table с диска, если там более новая версия — по
+    /// прямому запросу пользователя: "загрузил файл в вебе, хочу увидеть
+    /// сразу в открытом десктопе". Пароль не нужен, DEK уже в памяти. GUI
+    /// зовёт это по таймеру (main_window.py) и вручную по кнопке
+    /// "Обновить". Возвращает True, если состояние действительно обновилось
+    /// (есть смысл перерисовывать список).
+    fn reload(&mut self) -> PyResult<bool> {
+        self.get_mut()?.reload().map_err(to_py_err)
+    }
+
+    /// Компактификация (ROADMAP.md, "Компактификация свободных блоков") —
+    /// физически пересобирает файл-контейнер, отбрасывая орфанные блоки
+    /// удалённых/перезаписанных файлов и старые поколения File Table.
+    /// Требует прав администратора, дорогая операция — вызывается вручную
+    /// (например, по кнопке в настройках), не автоматически. Возвращает
+    /// число освобождённых байт.
+    fn compact(&mut self) -> PyResult<u64> {
+        self.get_mut()?.compact().map_err(to_py_err)
+    }
+
+    /// Номера страниц File Table, которые не удалось расшифровать при
+    /// последней загрузке (unlock/reload) — пусто в норме. Позволяет GUI
+    /// честно предупредить пользователя о частичной потере данных вместо
+    /// того, чтобы молча показать неполную библиотеку (ROADMAP.md,
+    /// "Восстановление при частичном повреждении File Table").
+    fn lost_file_table_pages(&self) -> PyResult<Vec<usize>> {
+        Ok(self.get()?.lost_file_table_pages().to_vec())
+    }
 }
 
 #[pyclass(name = "LockedContainer")]
@@ -386,5 +431,6 @@ fn cove_core_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<CoveAlreadyExistsError>(),
     )?;
     m.add("CovePermissionError", m.py().get_type::<CovePermissionError>())?;
+    m.add("CoveConflictError", m.py().get_type::<CoveConflictError>())?;
     Ok(())
 }

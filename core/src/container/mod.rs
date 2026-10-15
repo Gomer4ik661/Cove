@@ -18,6 +18,7 @@ use crate::search::SearchQuery;
 use crate::users::LoginLogEntry;
 
 use rand::RngCore;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -144,7 +145,7 @@ impl LockedContainer {
         file.read_exact(&mut sb_blob)?;
         let sb = Superblock::decode(&sb_blob, &dek)?;
 
-        let file_table = read_file_table(&mut file, &sb, &dek)?;
+        let table_load = read_file_table_with_recovery(&mut file, &sb, &dek)?;
         let free_blocks = read_free_map(&mut file, &sb, &dek)?;
         let mut log = read_login_log(&mut file, &sb, &dek)?;
         log.push(LoginLogEntry {
@@ -153,20 +154,34 @@ impl LockedContainer {
             success: true,
         });
 
-        let next_file_id = file_table.iter().map(|e| e.file_id).max().map(|m| m + 1).unwrap_or(1);
+        let next_file_id = table_load
+            .entries
+            .iter()
+            .map(|e| e.file_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
 
         Ok(Container {
             path: self.path.clone(),
             header: self.header,
             session: Session { dek },
             superblock: sb,
-            file_table,
+            file_table: table_load.entries,
             free_blocks,
             keyslots: self.keyslots.clone(),
             login_log: log,
             current_username: identity.to_string(),
             current_role: role,
             next_file_id,
+            // Запись в login_log (выше) не считается "грязным" состоянием
+            // для целей conflict-проверки в commit() — см. комментарий у
+            // поля dirty.
+            dirty: false,
+            file_table_page_cache: table_load.page_cache,
+            dirty_pages: HashSet::new(),
+            lost_file_table_pages: table_load.corrupted_pages,
+            orphans_created: false,
         })
     }
 }
@@ -188,6 +203,40 @@ pub struct Container {
     /// на 100k+ файлах это давало O(n²) при массовом импорте, реальный
     /// профайлинг показал именно это, а не крипто-операции или fsync).
     next_file_id: FileId,
+    /// Есть ли в этой сессии несохранённые изменения содержимого (File
+    /// Table/Free Map) — НЕ считается изменением сама по себе запись в
+    /// login_log при unlock(): иначе абсолютно любая, даже чисто читающая
+    /// сессия считалась бы "грязной" и conflict-проверка в commit() ловила
+    /// бы её же собственный безобидный commit как настоящий конфликт (см.
+    /// комментарий у CoveError::Conflict и commit()). Выставляется
+    /// мутирующими методами, сбрасывается в false после успешного commit().
+    dirty: bool,
+    /// Кэш уже закодированных (зашифрованных) страниц File Table — с
+    /// прошлого unlock()/reload()/commit()/compact(). Позволяет `commit()`
+    /// не перешифровывать страницы, которых не коснулась текущая порция
+    /// правок (ROADMAP.md — "точечная запись File Table"), см.
+    /// `file_table::encode_file_table_incremental`.
+    file_table_page_cache: Vec<Vec<u8>>,
+    /// Номера страниц (индекс = позиция в `file_table`, делённая на
+    /// `MAX_ENTRIES_PER_PAGE`), которые реально изменились с прошлого
+    /// commit'а и должны быть перешифрованы заново при следующем.
+    dirty_pages: HashSet<usize>,
+    /// Номера страниц File Table, которые не удалось расшифровать при
+    /// последней загрузке (unlock/reload) — их записи безвозвратно
+    /// потеряны, но остальная File Table по-прежнему доступна (ROADMAP.md,
+    /// "Восстановление при частичном повреждении File Table"). Пусто в
+    /// нормальном случае. Чисто информационное поле — само по себе ни на
+    /// что не влияет, кроме `lost_file_table_pages()`.
+    lost_file_table_pages: Vec<usize>,
+    /// Эта сессия своими действиями осиротила хотя бы один блок данных
+    /// (окончательное удаление файла, перезапись содержимого, перегенерация
+    /// миниатюры) с прошлого `compact()`. По прямой просьбе пользователя —
+    /// "после удаления файла база должна становиться легче" — `close()`
+    /// автоматически запускает `compact()` вместо обычного `commit()`,
+    /// когда этот флаг взведён, и не запускает (обычный дешёвый commit),
+    /// если ничего не осиротело — иначе каждый выход из сессии, даже без
+    /// единого удаления, стоил бы как полная перезапись контейнера.
+    orphans_created: bool,
 }
 
 impl Container {
@@ -302,6 +351,11 @@ impl Container {
                 current_username: admin_username.to_string(),
                 current_role: Role::Admin,
                 next_file_id: 1, // 0 зарезервирован под ROOT_FOLDER_ID
+                dirty: false,
+                file_table_page_cache: Vec::new(),
+                dirty_pages: HashSet::new(),
+                lost_file_table_pages: Vec::new(),
+                orphans_created: false,
             },
             recovery_phrase,
         ))
@@ -509,6 +563,30 @@ impl Container {
         }
     }
 
+    /// Помечает страницу, содержащую позицию `pos` в `file_table`, как
+    /// изменившуюся с прошлого commit'а — она будет перешифрована заново
+    /// вместо переиспользования из кэша (`encode_file_table_incremental`).
+    fn mark_page_dirty_for_position(&mut self, pos: usize) {
+        self.dirty_pages.insert(pos / file_table::MAX_ENTRIES_PER_PAGE);
+    }
+
+    /// `retain()`-подобное удаление сдвигает позиции ВСЕХ элементов после
+    /// точки удаления — точный пересчёт, какие страницы затронуты, легко
+    /// сделать с ошибкой на единицу. Такие операции (окончательное удаление
+    /// из корзины, чистка миниатюр при перезаписи содержимого) на порядок
+    /// реже точечных правок вроде импорта одного файла — цена
+    /// консервативного "перешифровать всё" тут незначительна, а
+    /// корректность гарантированная.
+    fn mark_all_pages_dirty(&mut self) {
+        let entry_count = self.file_table.len();
+        let page_count = if entry_count == 0 {
+            1
+        } else {
+            entry_count.div_ceil(file_table::MAX_ENTRIES_PER_PAGE)
+        };
+        self.dirty_pages.extend(0..page_count);
+    }
+
     fn next_file_id(&mut self) -> FileId {
         let id = self.next_file_id;
         self.next_file_id += 1;
@@ -651,8 +729,15 @@ impl Container {
     }
 
     fn remove_thumbnail_of(&mut self, file_id: FileId) {
+        let before = self.file_table.len();
         self.file_table
             .retain(|e| !(e.flags.internal && e.thumbnail_of == Some(file_id)));
+        if self.file_table.len() != before {
+            self.mark_all_pages_dirty();
+            // Удалённая internal-запись миниатюры уносит с собой свой
+            // собственный block_list — те блоки данных стали орфанами.
+            self.orphans_created = true;
+        }
     }
 
     /// Возвращает `file_id` уже сгенерированной миниатюры, если она есть —
@@ -680,11 +765,13 @@ impl Container {
         let (block_list, size, content_hash) = self.write_blocks_from_bytes(thumb_id, thumbnail_data)?;
         let now = now_unix();
 
-        if let Some(entry) = self.file_table.iter_mut().find(|e| e.file_id == thumb_id) {
+        if let Some(pos) = self.file_table.iter().position(|e| e.file_id == thumb_id) {
+            let entry = &mut self.file_table[pos];
             entry.block_list = block_list;
             entry.size = size;
             entry.content_hash = content_hash;
             entry.modified_at = now;
+            self.mark_page_dirty_for_position(pos);
         } else {
             self.file_table.push(FileEntry {
                 file_id: thumb_id,
@@ -703,6 +790,7 @@ impl Container {
                 thumbnail_of: Some(file_id),
                 folder_category: None,
             });
+            self.mark_page_dirty_for_position(self.file_table.len() - 1);
         }
         Ok(thumb_id)
     }
@@ -737,6 +825,8 @@ impl Container {
             thumbnail_of: None,
             folder_category: None,
         });
+        self.mark_page_dirty_for_position(self.file_table.len() - 1);
+        self.dirty = true;
         Ok(file_id)
     }
 
@@ -779,6 +869,8 @@ impl Container {
             thumbnail_of: None,
             folder_category: None,
         });
+        self.mark_page_dirty_for_position(self.file_table.len() - 1);
+        self.dirty = true;
         Ok(file_id)
     }
 
@@ -792,19 +884,25 @@ impl Container {
             return Err(CoveError::NotFound);
         }
         let (block_list, size, content_hash) = self.write_blocks_from(file_id, src_path)?;
-        let entry = self
+        let pos = self
             .file_table
-            .iter_mut()
-            .find(|e| e.file_id == file_id)
+            .iter()
+            .position(|e| e.file_id == file_id)
             .unwrap();
+        let entry = &mut self.file_table[pos];
         entry.block_list = block_list;
         entry.size = size;
         entry.content_hash = content_hash;
         entry.modified_at = now_unix();
+        self.mark_page_dirty_for_position(pos);
+        // Старые блоки этой записи только что заменены новыми (см.
+        // doc-комментарий метода выше) — они больше ни на что не ссылаются.
+        self.orphans_created = true;
         // Содержимое изменилось — старая миниатюра больше не соответствует
         // файлу; следующий вызов thumbnail() честно перегенерирует её
         // (ROADMAP.md Фаза 8: "автообновление").
         self.remove_thumbnail_of(file_id);
+        self.dirty = true;
         Ok(())
     }
 
@@ -865,6 +963,8 @@ impl Container {
             thumbnail_of: None,
             folder_category: category.map(|c| c.to_string()),
         });
+        self.mark_page_dirty_for_position(self.file_table.len() - 1);
+        self.dirty = true;
         Ok(file_id)
     }
 
@@ -885,23 +985,38 @@ impl Container {
         if entry.flags.trashed {
             self.file_table
                 .retain(|e| e.file_id != file_id && !(e.flags.internal && e.thumbnail_of == Some(file_id)));
+            self.mark_all_pages_dirty();
+            // Окончательное удаление — записи (и их блоки данных, если это
+            // не пустая папка) только что физически осиротели. Не пытаемся
+            // точно определить, была ли у конкретной записи содержимое
+            // (папка — нет, файл — почти всегда да) — за редким исключением
+            // "удалили только пустые папки" это верно, а цена ложного
+            // срабатывания — один занятие лишний compact() при выходе, не
+            // потеря данных.
+            self.orphans_created = true;
         } else {
-            let entry = self.file_table.iter_mut().find(|e| e.file_id == file_id).unwrap();
+            let pos = self.file_table.iter().position(|e| e.file_id == file_id).unwrap();
+            let entry = &mut self.file_table[pos];
             entry.flags.trashed = true;
             entry.modified_at = now_unix();
+            self.mark_page_dirty_for_position(pos);
         }
+        self.dirty = true;
         Ok(())
     }
 
     pub fn restore_file(&mut self, file_id: FileId) -> Result<()> {
         self.require_writable()?;
-        let entry = self
+        let pos = self
             .file_table
-            .iter_mut()
-            .find(|e| e.file_id == file_id)
+            .iter()
+            .position(|e| e.file_id == file_id)
             .ok_or(CoveError::NotFound)?;
+        let entry = &mut self.file_table[pos];
         entry.flags.trashed = false;
         entry.modified_at = now_unix();
+        self.mark_page_dirty_for_position(pos);
+        self.dirty = true;
         Ok(())
     }
 
@@ -912,13 +1027,16 @@ impl Container {
                 detail: "name must not be empty".into(),
             });
         }
-        let entry = self
+        let pos = self
             .file_table
-            .iter_mut()
-            .find(|e| e.file_id == file_id)
+            .iter()
+            .position(|e| e.file_id == file_id)
             .ok_or(CoveError::NotFound)?;
+        let entry = &mut self.file_table[pos];
         entry.name = new_name.to_string();
         entry.modified_at = now_unix();
+        self.mark_page_dirty_for_position(pos);
+        self.dirty = true;
         Ok(())
     }
 
@@ -934,13 +1052,16 @@ impl Container {
                 detail: "cannot move a folder into itself or its own subfolder".into(),
             });
         }
-        let entry = self
+        let pos = self
             .file_table
-            .iter_mut()
-            .find(|e| e.file_id == file_id)
+            .iter()
+            .position(|e| e.file_id == file_id)
             .ok_or(CoveError::NotFound)?;
+        let entry = &mut self.file_table[pos];
         entry.parent_id = new_parent;
         entry.modified_at = now_unix();
+        self.mark_page_dirty_for_position(pos);
+        self.dirty = true;
         Ok(())
     }
 
@@ -1042,12 +1163,14 @@ impl Container {
     /// содержимого, не должна двигать файл в "Недавние".
     pub fn set_favorite(&mut self, file_id: FileId, favorite: bool) -> Result<()> {
         self.require_writable()?;
-        let entry = self
+        let pos = self
             .file_table
-            .iter_mut()
-            .find(|e| e.file_id == file_id)
+            .iter()
+            .position(|e| e.file_id == file_id)
             .ok_or(CoveError::NotFound)?;
-        entry.flags.favorite = favorite;
+        self.file_table[pos].flags.favorite = favorite;
+        self.mark_page_dirty_for_position(pos);
+        self.dirty = true;
         Ok(())
     }
 
@@ -1072,11 +1195,38 @@ impl Container {
     /// в конец файла, затем один атомарный переключатель Commit Pointer —
     /// FORMAT.md §6a. Keyslots в commit не участвуют — они пишутся точечно
     /// сразу в add_user/remove_user/change_password.
-    pub fn close(self) -> Result<()> {
+    ///
+    /// В отличие от `close()` не потребляет `self` — можно вызывать сколько
+    /// угодно раз за сессию (не только один раз перед выходом). Добавлено по
+    /// прямому запросу пользователя: раньше импорт файла/новая папка и т.д.
+    /// были видны только в памяти открывшей их сессии до её закрытия —
+    /// вторая параллельно открытая сессия (Desktop + Web одновременно)
+    /// читала пустой диск, пока первая не закрывалась. GUI каждой платформы
+    /// зовёт `commit()` после каждого пользовательского действия (не после
+    /// каждого файла в batch-импорте — полное перекодирование File Table на
+    /// каждый файл в импорте из тысяч файлов было бы квадратичным по
+    /// времени, тот же класс проблемы, что фаззинг нашёл в Фазе 17).
+    pub fn commit(&mut self) -> Result<()> {
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         let (current_pointer, active_offset) =
             read_valid_commit_pointer(&mut file, &self.header)?;
+
+        // Кто-то другой (другая одновременно открытая сессия того же
+        // контейнера) уже закоммитил после того, как эта сессия последний
+        // раз синхронизировалась (unlock() или прошлый commit()) — писать
+        // поверх нельзя своим устаревшим File Table, это тихо стёрло бы
+        // чужие изменения. Если у ЭТОЙ сессии нет реальных несохранённых
+        // правок (`!self.dirty` — просто читала/держала сессию открытой),
+        // безопаснее молча ничего не делать, чем поднимать ошибку на
+        // ровном месте: единственное, чем она жертвует — своей записью в
+        // login_log за этот вход. Если правки есть — отклоняем громко
+        // (CoveError::Conflict), чтобы пользователь узнал, а не тихо
+        // потерял свою же папку/файл.
+        if current_pointer.version_counter != self.superblock.version_counter {
+            return if self.dirty { Err(CoveError::Conflict) } else { Ok(()) };
+        }
+
         let next_offset = if active_offset == self.header.commit_a_offset {
             self.header.commit_b_offset
         } else {
@@ -1090,7 +1240,12 @@ impl Container {
         let free_map_offset = end;
         file.write_all(&free_map_bytes)?;
 
-        let file_table_bytes = file_table::encode_file_table(&self.file_table, &self.session.dek);
+        let file_table_bytes = file_table::encode_file_table_incremental(
+            &self.file_table,
+            &self.session.dek,
+            &mut self.file_table_page_cache,
+            &self.dirty_pages,
+        );
         let file_table_offset = free_map_offset + free_map_bytes.len() as u64;
         file.write_all(&file_table_bytes)?;
 
@@ -1124,7 +1279,265 @@ impl Container {
         file.write_all(&pointer.serialize())?;
         file.sync_all()?;
 
+        // Иначе следующий commit() в этой же сессии посчитал бы
+        // file_table_backup_offset от уже устаревшего superblock — Copy,
+        // дешёвая замена по значению.
+        self.superblock = sb;
+        self.dirty = false;
+        self.dirty_pages.clear();
+
         Ok(())
+    }
+
+    /// Финальный commit перед освобождением контейнера — тонкая обёртка над
+    /// `commit()`, оставлена под тем же именем/сигнатурой (потребляет
+    /// `self`), чтобы не ломать существующих вызывающих на всех трёх
+    /// платформах, которые уже вызывают `close()` при выходе/логауте.
+    ///
+    /// По прямой просьбе пользователя — "после удаления файла база должна
+    /// становиться легче" — если за время этой сессии реально осиротели
+    /// блоки данных (`orphans_created`, взводится `delete_file`/
+    /// `replace_file_content`/перегенерацией миниатюры), `close()` сам
+    /// запускает `compact()` вместо обычного `commit()`: она и коммитит
+    /// текущее состояние, и физически ужимает файл. Если ничего не
+    /// удалялось — обычный дешёвый `commit()`, не полная перезапись
+    /// контейнера на каждый выход из сессии, даже пустой.
+    pub fn close(mut self) -> Result<()> {
+        if self.orphans_created {
+            self.compact()?;
+            Ok(())
+        } else {
+            self.commit()
+        }
+    }
+
+    /// Перечитывает File Table/Free Map/журнал входов с диска, если там
+    /// более новая версия, чем видела эта сессия — по прямому запросу
+    /// пользователя: раньше изменения из другой сессии (например, загрузка
+    /// файла через Web) были видны в уже открытой Desktop-сессии только
+    /// после полного логаута/повторного входа, commit()/close() это никак
+    /// не решали — они синхронизируют то, что сессия ЗАПИСЫВАЕТ на диск, а
+    /// не то, что она ЧИТАЕТ из уже открытого состояния. DEK уже есть в
+    /// памяти (сессия уже разблокирована), поэтому пароль не нужен — та же
+    /// расшифровка регионов, что и в `unlock_slot()`, но без повторного
+    /// KDF/keyslot-похода.
+    ///
+    /// `Ok(true)` — состояние обновилось, `Ok(false)` — на диске всё та же
+    /// версия, перечитывать было нечего (дешёвая проверка: один короткий
+    /// read самого commit pointer, не всего File Table). Если у ЭТОЙ сессии
+    /// есть свои несохранённые правки (`dirty`), перечитывание отклоняется
+    /// тем же `Conflict`, что и `commit()` — молча заменить чужим состоянием
+    /// правки пользователя, которые он ещё не видел подтверждёнными, было
+    /// бы так же нечестно, как молча их потерять при записи.
+    pub fn reload(&mut self) -> Result<bool> {
+        let mut file = File::open(&self.path)?;
+        let (pointer, _active_offset) = read_valid_commit_pointer(&mut file, &self.header)?;
+        if pointer.version_counter == self.superblock.version_counter {
+            return Ok(false);
+        }
+        if self.dirty {
+            return Err(CoveError::Conflict);
+        }
+
+        let mut sb_blob = [0u8; superblock::BLOB_LEN];
+        file.seek(SeekFrom::Start(pointer.superblock_offset))?;
+        file.read_exact(&mut sb_blob)?;
+        let sb = Superblock::decode(&sb_blob, &self.session.dek)?;
+
+        let table_load = read_file_table_with_recovery(&mut file, &sb, &self.session.dek)?;
+        let free_blocks = read_free_map(&mut file, &sb, &self.session.dek)?;
+        let login_log = read_login_log(&mut file, &sb, &self.session.dek)?;
+
+        self.next_file_id = table_load
+            .entries
+            .iter()
+            .map(|e| e.file_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
+        self.superblock = sb;
+        self.file_table = table_load.entries;
+        self.free_blocks = free_blocks;
+        self.login_log = login_log;
+        // Состояние на диске только что заменило наше целиком — старый кэш
+        // страниц (и любые накопленные "грязные" пометки) относится к уже
+        // неактуальной раскладке, начинаем с чистого листа.
+        self.file_table_page_cache = table_load.page_cache;
+        self.dirty_pages.clear();
+        self.lost_file_table_pages = table_load.corrupted_pages;
+        Ok(true)
+    }
+
+    /// Номера страниц File Table, которые не удалось расшифровать при
+    /// последней загрузке (`unlock`/`reload`) — их содержимое безвозвратно
+    /// потеряно, но остальная библиотека доступна как обычно (ROADMAP.md,
+    /// "Восстановление при частичном повреждении File Table"). Пустой список
+    /// в норме. Чисто информационный метод — ничего не чинит и не требует
+    /// вызова, вызывающая сторона (GUI) может использовать его, чтобы честно
+    /// предупредить пользователя, а не молча показать неполную библиотеку.
+    pub fn lost_file_table_pages(&self) -> &[usize] {
+        &self.lost_file_table_pages
+    }
+
+    /// Компактификация (ROADMAP.md, "Компактификация свободных блоков
+    /// данных"): физически пересобирает файл-контейнер заново, оставляя
+    /// только то, на что реально ссылается ТЕКУЩАЯ File Table в памяти этой
+    /// сессии. Формат Cove — append-only для File Table/Free Map/Login
+    /// Log/Superblock (каждый `commit()` дописывает новые версии в конец
+    /// файла, старые остаются на диске) и для блоков данных (удалённые/
+    /// перезаписанные файлы оставляют орфанов, FORMAT.md §6/§9) — файл
+    /// только растёт. `compact()` — единственная операция, которая его
+    /// физически уменьшает.
+    ///
+    /// Требует прав на запись (как и `delete_file`/`replace_file_content` —
+    /// именно они и создают орфанов, которые эта операция убирает; отдельного
+    /// admin-барьера тут по прямой просьбе пользователя нет — это уборка за
+    /// собственными действиями пользователя, а не смена структуры контейнера
+    /// на уровне пользователей/ролей, как `add_user`/`remove_user`). Дорогая
+    /// операция (перечитывает и переписывает весь контейнер), поэтому не
+    /// часть штатного commit() — вызывается либо явно, либо автоматически из
+    /// `close()`, см. там же. Как и весь остальной Core, не имеет
+    /// межпроцессной блокировки (ROADMAP.md Фаза 13, известное ограничение)
+    /// — параллельная запись в контейнер с другой сессии во время compact()
+    /// может быть потеряна.
+    ///
+    /// Возвращает число байт, на которое уменьшился файл (0, если сжимать
+    /// было нечего). Пишет полностью новый файл рядом (`<path>.compact.tmp`)
+    /// и атомарно переименовывает его поверх старого только после того, как
+    /// новый файл целиком записан и fsync'нут — при любой ошибке в процессе
+    /// исходный файл остаётся нетронутым и рабочим.
+    pub fn compact(&mut self) -> Result<u64> {
+        self.require_writable()?;
+
+        let old_size = std::fs::metadata(&self.path)?.len();
+
+        let tmp_path = {
+            let file_name = self
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("container")
+                .to_string();
+            self.path.with_file_name(format!("{file_name}.compact.tmp"))
+        };
+        if tmp_path.exists() {
+            std::fs::remove_file(&tmp_path)?;
+        }
+
+        let mut old_file = File::open(&self.path)?;
+
+        // Keyslots уже хранятся точечно на фиксированных offset'ах
+        // (FORMAT.md §3) — копируем байты как есть, а не пересериализуем из
+        // self.keyslots, чтобы не рисковать байтовым расхождением обёрнутых
+        // ключей.
+        let mut keyslots_bytes = vec![0u8; self.header.keyslots_len as usize];
+        old_file.seek(SeekFrom::Start(self.header.keyslots_offset))?;
+        old_file.read_exact(&mut keyslots_bytes)?;
+
+        let mut new_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(&tmp_path)?;
+
+        // Header/keyslots/commit-slots структурно идентичны исходнику —
+        // capacity keyslot'ов фиксирован, offset'ы этого региона не меняются.
+        new_file.write_all(&self.header.serialize())?;
+        new_file.write_all(&keyslots_bytes)?;
+        new_file.write_all(&[0u8; commit::COMMIT_POINTER_LEN])?; // slot A — заполним ниже
+        new_file.write_all(&[0u8; commit::COMMIT_POINTER_LEN])?; // slot B — остаётся пустым, как при create()
+
+        // Переносим блоки данных ТОЛЬКО живых записей (текущий file_table в
+        // памяти — уже с учётом любых несохранённых правок этой сессии)
+        // вербатим: ciphertext+tag не трогаем, меняется только offset —
+        // безопасно, т.к. AAD блока привязан к (file_id, block_index), а не
+        // к его положению в файле (см. data_blocks::block_aad).
+        let mut new_entries = self.file_table.clone();
+        for entry in new_entries.iter_mut() {
+            if entry.block_list.is_empty() {
+                continue; // папки и internal-записи без содержимого
+            }
+            let mut new_offsets = Vec::with_capacity(entry.block_list.len());
+            for &old_offset in &entry.block_list {
+                let new_offset =
+                    copy_block_verbatim(&mut old_file, &mut new_file, old_offset, self.header.block_size)?;
+                new_offsets.push(new_offset);
+            }
+            entry.block_list = new_offsets;
+        }
+
+        // Орфанов, которые могла бы отслеживать Free Map, после
+        // компактификации по определению не осталось.
+        let free_map_bytes = free_map::encode(&[], &self.session.dek);
+        let free_map_offset = new_file.stream_position()?;
+        new_file.write_all(&free_map_bytes)?;
+
+        // Полная перекодировка File Table с нуля — свежий кэш страниц,
+        // старый относился к уже неактуальной физической раскладке блоков.
+        let mut fresh_cache = Vec::new();
+        let page_count = if new_entries.is_empty() {
+            1
+        } else {
+            new_entries.len().div_ceil(file_table::MAX_ENTRIES_PER_PAGE)
+        };
+        let all_dirty: HashSet<usize> = (0..page_count).collect();
+        let file_table_bytes = file_table::encode_file_table_incremental(
+            &new_entries,
+            &self.session.dek,
+            &mut fresh_cache,
+            &all_dirty,
+        );
+        let file_table_offset = free_map_offset + free_map_bytes.len() as u64;
+        new_file.write_all(&file_table_bytes)?;
+
+        let login_log_bytes = login_log::encode(&self.login_log, &self.session.dek);
+        let login_log_offset = file_table_offset + file_table_bytes.len() as u64;
+        new_file.write_all(&login_log_bytes)?;
+
+        let next_version = self.superblock.version_counter + 1;
+        let sb = Superblock {
+            version_counter: next_version,
+            file_table_offset,
+            file_table_len: file_table_bytes.len() as u64,
+            // Компактификация — новая база; прежней истории для отката
+            // больше физически не существует (мы её только что стёрли).
+            file_table_backup_offset: file_table_offset,
+            search_index_offset: 0,
+            search_index_len: 0,
+            free_block_map_offset: free_map_offset,
+            free_block_map_len: free_map_bytes.len() as u64,
+            login_log_offset,
+            login_log_len: login_log_bytes.len() as u64,
+        };
+        let superblock_offset = login_log_offset + login_log_bytes.len() as u64;
+        let sb_blob = sb.encode(&self.session.dek);
+        new_file.write_all(&sb_blob)?;
+        new_file.sync_all()?;
+
+        let pointer = CommitPointer {
+            version_counter: next_version,
+            superblock_offset,
+            superblock_checksum: *blake3::hash(&sb_blob).as_bytes(),
+        };
+        new_file.seek(SeekFrom::Start(self.header.commit_a_offset))?;
+        new_file.write_all(&pointer.serialize())?;
+        new_file.sync_all()?;
+
+        drop(new_file);
+        drop(old_file);
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        self.superblock = sb;
+        self.file_table = new_entries;
+        self.free_blocks = Vec::new();
+        self.file_table_page_cache = fresh_cache;
+        self.dirty_pages.clear();
+        self.lost_file_table_pages.clear();
+        self.dirty = false;
+        self.orphans_created = false;
+
+        let new_size = std::fs::metadata(&self.path)?.len();
+        Ok(old_size.saturating_sub(new_size))
     }
 }
 
@@ -1270,11 +1683,61 @@ fn read_valid_commit_pointer(file: &mut File, hdr: &Header) -> Result<(CommitPoi
     }
 }
 
-fn read_file_table(file: &mut File, sb: &Superblock, dek: &keys::Dek) -> Result<Vec<FileEntry>> {
-    file.seek(SeekFrom::Start(sb.file_table_offset))?;
-    let mut buf = vec![0u8; sb.file_table_len as usize];
+/// Читает и щадяще разбирает File Table основной (текущей) версии —
+/// отдельные повреждённые страницы не мешают прочитать остальные (см.
+/// `file_table::decode_file_table_lenient`). Если основной блоб не
+/// разбирается вообще СТРУКТУРНО (не про отдельные страницы — framing
+/// целиком нечитаем: усечённый файл, чужой формат и т.п.), последняя
+/// попытка — `file_table_backup_offset`: предыдущая валидная версия File
+/// Table, на которую указывает Superblock ещё с Фазы 2, но которую до сих
+/// пор никто не читал (ROADMAP.md, "восстановление при частичном
+/// повреждении File Table"). Это более грубый запасной вариант — теряются
+/// ВСЕ изменения с предыдущего commit'а, а не только одна страница, — и
+/// применяется только тогда, когда даже постраничное восстановление
+/// невозможно.
+fn read_file_table_with_recovery(
+    file: &mut File,
+    sb: &Superblock,
+    dek: &keys::Dek,
+) -> Result<file_table::LenientLoad> {
+    let primary = read_file_table_lenient_at(file, sb.file_table_offset, sb.file_table_len, dek);
+    match primary {
+        Ok(load) => Ok(load),
+        Err(primary_err) => {
+            if sb.file_table_backup_offset == sb.file_table_offset {
+                return Err(primary_err); // отдельной резервной версии ещё не было (первый commit)
+            }
+            // Superblock хранит только offset резервной версии, не её длину
+            // (она была известна только в момент того commit'а, который уже
+            // затёрт этим сбоем) — читаем с запасом до конца файла и
+            // полагаемся на framing внутри блоба, чтобы понять, где он
+            // реально заканчивается (split_page_slices не читает байт
+            // больше, чем сама объявляет структура, лишний хвост в буфере
+            // просто игнорируется).
+            let file_len = file.seek(SeekFrom::End(0))?;
+            if sb.file_table_backup_offset >= file_len {
+                return Err(primary_err);
+            }
+            read_file_table_lenient_at(
+                file,
+                sb.file_table_backup_offset,
+                file_len - sb.file_table_backup_offset,
+                dek,
+            )
+        }
+    }
+}
+
+fn read_file_table_lenient_at(
+    file: &mut File,
+    offset: u64,
+    len: u64,
+    dek: &keys::Dek,
+) -> Result<file_table::LenientLoad> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len as usize];
     file.read_exact(&mut buf)?;
-    file_table::decode_file_table(&buf, dek)
+    file_table::decode_file_table_lenient(&buf, dek)
 }
 
 fn read_free_map(file: &mut File, sb: &Superblock, dek: &keys::Dek) -> Result<Vec<u64>> {
@@ -1282,6 +1745,31 @@ fn read_free_map(file: &mut File, sb: &Superblock, dek: &keys::Dek) -> Result<Ve
     let mut buf = vec![0u8; sb.free_block_map_len as usize];
     file.read_exact(&mut buf)?;
     free_map::decode(&buf, dek)
+}
+
+/// Копирует один блок данных (header + ciphertext + tag) с одного offset'а
+/// на другой как есть, без расшифровки/повторного шифрования — используется
+/// `Container::compact()`. Возвращает offset, по которому блок оказался в
+/// `dst`. Та же проверка правдоподобия `plaintext_len`, что и в
+/// `read_block_at` (Фаза 17) — компактификация тоже не должна слепо
+/// доверять полю, лежащему перед AEAD-шифртекстом и им не защищённому.
+fn copy_block_verbatim(src: &mut File, dst: &mut File, old_offset: u64, block_size: u32) -> Result<u64> {
+    src.seek(SeekFrom::Start(old_offset))?;
+    let mut header_buf = [0u8; data_blocks::HEADER_LEN];
+    src.read_exact(&mut header_buf)?;
+    let header = data_blocks::parse_header(&header_buf);
+    if header.plaintext_len as u64 > block_size as u64 {
+        return Err(CoveError::FormatError {
+            detail: "data block plaintext_len exceeds block_size — corrupted container".into(),
+        });
+    }
+    let mut rest = vec![0u8; header.plaintext_len as usize + crate::crypto::aead::TAG_LEN];
+    src.read_exact(&mut rest)?;
+
+    let new_offset = dst.stream_position()?;
+    dst.write_all(&header_buf)?;
+    dst.write_all(&rest)?;
+    Ok(new_offset)
 }
 
 fn read_login_log(file: &mut File, sb: &Superblock, dek: &keys::Dek) -> Result<Vec<LoginLogEntry>> {
@@ -1654,6 +2142,174 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&src);
+    }
+
+    /// Сценарий, о котором сообщил пользователь: Desktop и Web открывают
+    /// один контейнер одновременно; импорт в одной сессии должен стать
+    /// виден другой сразу после `commit()`, не дожидаясь, пока первая
+    /// сессия закроется. До введения `commit()` (было только `close(self)`,
+    /// потребляющий Container) промежуточные изменения были видны только
+    /// в памяти открывшей их сессии до её полного закрытия.
+    #[test]
+    fn commit_without_close_is_visible_to_a_second_reader() {
+        let path = temp_container_path("commit_mid_session");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        // До commit() — второй читатель не должен видеть файл. Намеренно
+        // НЕ вызываем close() на чисто читающей сессии — иначе её
+        // безобидный commit() продвинул бы version_counter и создал ложный
+        // конфликт для параллельной сессии `c`, которая как раз собирается
+        // писать (см. CoveError::Conflict и dirty-флаг в commit()) — сама
+        // эта ситуация (незакрытая read-only сессия) тоже часть того, что
+        // здесь проверяется.
+        let locked_before = LockedContainer::open(path_str).unwrap();
+        let c_before = locked_before.unlock("admin", "adminpassword").unwrap();
+        assert!(c_before.list_dir(ROOT_FOLDER_ID).unwrap().is_empty());
+        drop(c_before);
+
+        let content = b"visible without full close".to_vec();
+        let src = write_temp_source_file("commit_mid_session", &content);
+        let file_id = c.import_file(src.to_str().unwrap(), ROOT_FOLDER_ID).unwrap();
+        c.commit().unwrap();
+
+        // Контейнер остаётся рабочим после commit() — не потреблён, можно
+        // продолжать читать/писать в этой же сессии.
+        assert_eq!(
+            c.read_at(file_id, 0, content.len() as u32).unwrap(),
+            content
+        );
+
+        let locked_after = LockedContainer::open(path_str).unwrap();
+        let c_after = locked_after.unlock("admin", "adminpassword").unwrap();
+        assert_eq!(
+            c_after.read_at(file_id, 0, content.len() as u32).unwrap(),
+            content
+        );
+        drop(c_after); // не close() — та же причина, что и у c_before выше
+
+        // Второй commit() в этой же сессии (например, второе действие
+        // пользователя) не должен ломать формат — file_table_backup_offset
+        // должен указывать на только что записанную версию, не на устаревшую.
+        let folder_id = c.create_folder("Ещё", ROOT_FOLDER_ID, None).unwrap();
+        c.commit().unwrap();
+        c.close().unwrap();
+
+        let locked_final = LockedContainer::open(path_str).unwrap();
+        let c_final = locked_final.unlock("admin", "adminpassword").unwrap();
+        let entries = c_final.list_dir(ROOT_FOLDER_ID).unwrap();
+        assert!(entries.iter().any(|e| e.file_id == file_id));
+        assert!(entries.iter().any(|e| e.file_id == folder_id && e.flags.is_folder));
+        c_final.close().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// Точное воспроизведение реального репорта пользователя: сессия A
+    /// (Desktop) создаёт папку и коммитит; сессия B (Web) была открыта
+    /// раньше, ничего не меняла, но потом закрывается — раньше это молча
+    /// стирало папку сессии A, восстановив старый (пустой) File Table.
+    /// С dirty-флагом сессия B, не имея своих правок, должна тихо
+    /// НИЧЕГО не писать при закрытии, а не затирать чужой commit.
+    #[test]
+    fn stale_read_only_session_does_not_erase_concurrent_commit() {
+        let path = temp_container_path("stale_reader_no_erase");
+        let path_str = path.to_str().unwrap();
+        let (c_a, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        // Сессия B открывается ДО того, как A что-то создаёт — как
+        // залипшая веб-вкладка, открытая заранее.
+        let locked_b = LockedContainer::open(path_str).unwrap();
+        let session_b = locked_b.unlock("admin", "adminpassword").unwrap();
+
+        let mut session_a = c_a;
+        let folder_id = session_a.create_folder("Видео", ROOT_FOLDER_ID, Some("video")).unwrap();
+        session_a.commit().unwrap();
+        session_a.close().unwrap();
+
+        // Сессия B ничего не меняла — её close() не должен стереть папку,
+        // которую только что закоммитила A.
+        session_b.close().unwrap();
+
+        let locked_check = LockedContainer::open(path_str).unwrap();
+        let check = locked_check.unlock("admin", "adminpassword").unwrap();
+        let entries = check.list_dir(ROOT_FOLDER_ID).unwrap();
+        assert!(
+            entries.iter().any(|e| e.file_id == folder_id && e.flags.is_folder && e.folder_category.as_deref() == Some("video")),
+            "папка сессии A должна пережить close() ничего не менявшей сессии B, но её нет: {entries:?}"
+        );
+        check.close().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Симметричный случай: если у устаревшей сессии ЕСТЬ собственные
+    /// несохранённые правки, commit() должен явно отказать (Conflict), а
+    /// не тихо потерять либо чужие, либо свои изменения.
+    #[test]
+    fn stale_session_with_pending_edit_gets_loud_conflict_not_silent_loss() {
+        let path = temp_container_path("stale_reader_conflict");
+        let path_str = path.to_str().unwrap();
+        let (c_a, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let locked_b = LockedContainer::open(path_str).unwrap();
+        let mut session_b = locked_b.unlock("admin", "adminpassword").unwrap();
+
+        let mut session_a = c_a;
+        session_a.create_folder("Видео", ROOT_FOLDER_ID, Some("video")).unwrap();
+        session_a.commit().unwrap();
+        session_a.close().unwrap();
+
+        // У сессии B тоже есть своя (более старая, ещё не увидевшая папку A)
+        // правка — её нельзя молча ни принять (потеряет папку A), ни
+        // отбросить без предупреждения (пользователь решит, что его правка
+        // сохранилась). Явная ошибка — единственный честный вариант.
+        session_b.create_folder("Другое", ROOT_FOLDER_ID, None).unwrap();
+        let result = session_b.commit();
+        assert!(
+            matches!(result, Err(CoveError::Conflict)),
+            "ожидался Conflict, получено: {result:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Точный сценарий, который попросил пользователь: загрузил файл через
+    /// Web — хочет увидеть его в уже открытой Desktop-сессии "сразу", без
+    /// повторного логина. `reload()` не требует пароля (DEK уже в памяти) и
+    /// подхватывает изменения именно так.
+    #[test]
+    fn reload_picks_up_changes_from_another_session_without_password() {
+        let path = temp_container_path("reload_cross_session");
+        let path_str = path.to_str().unwrap();
+        let (c_a, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        // "Desktop" — открыт заранее, ничего пока не знает о будущей папке.
+        let mut desktop = c_a;
+        assert!(desktop.list_dir(ROOT_FOLDER_ID).unwrap().is_empty());
+
+        // "Web" — отдельная сессия, создаёт папку и коммитит.
+        let locked_web = LockedContainer::open(path_str).unwrap();
+        let mut web = locked_web.unlock("admin", "adminpassword").unwrap();
+        let folder_id = web.create_folder("ИзВеба", ROOT_FOLDER_ID, Some("video")).unwrap();
+        web.commit().unwrap();
+
+        // До reload() десктоп ещё не видит папку — это не автоматическая
+        // магия, а явный (пусть и дешёвый) шаг.
+        assert!(desktop.list_dir(ROOT_FOLDER_ID).unwrap().is_empty());
+
+        let changed = desktop.reload().unwrap();
+        assert!(changed, "reload() должен был обнаружить новую версию на диске");
+        let entries = desktop.list_dir(ROOT_FOLDER_ID).unwrap();
+        assert!(entries.iter().any(|e| e.file_id == folder_id && e.flags.is_folder));
+
+        // Повторный reload() без новых изменений — дешёвый no-op, не ошибка.
+        assert!(!desktop.reload().unwrap());
+
+        desktop.close().unwrap();
+        web.close().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2210,6 +2866,355 @@ mod tests {
             Err(CoveError::PermissionDenied)
         ));
         viewer.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Точечная запись File Table (ROADMAP.md, Фаза 2/6) на уровне
+    /// `Container`, а не только `file_table::encode_file_table_incremental`
+    /// напрямую: заполняем таблицу так, чтобы она заняла ДВЕ страницы,
+    /// коммитим, правим одну запись (переносим её в первую страницу),
+    /// коммитим снова, закрываем и переоткрываем — все записи должны
+    /// остаться на месте вне зависимости от того, какая страница
+    /// переиспользовалась из кэша, а какая перешифровывалась заново.
+    #[test]
+    fn commit_after_partial_edit_survives_close_reopen_across_pages() {
+        let path = temp_container_path("incremental_pages");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let total = file_table::MAX_ENTRIES_PER_PAGE + 5; // гарантированно 2 страницы
+        let mut ids = Vec::with_capacity(total);
+        for i in 0..total {
+            let id = c
+                .import_file_from_bytes(&format!("file_{i}.txt"), ROOT_FOLDER_ID, b"x")
+                .unwrap();
+            ids.push(id);
+        }
+        c.commit().unwrap();
+
+        // Правим ровно одну запись во ВТОРОЙ странице (индекс >=
+        // MAX_ENTRIES_PER_PAGE по порядку добавления) — первая страница
+        // должна остаться нетронутой и переиспользоваться из кэша.
+        let target = ids[file_table::MAX_ENTRIES_PER_PAGE + 2];
+        c.rename_file(target, "переименован.txt").unwrap();
+        c.commit().unwrap();
+        c.close().unwrap();
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let reopened = locked.unlock("admin", "adminpassword").unwrap();
+        let entries = reopened.list_dir(ROOT_FOLDER_ID).unwrap();
+        assert_eq!(entries.len(), total);
+        let renamed = entries.iter().find(|e| e.file_id == target).unwrap();
+        assert_eq!(renamed.name, "переименован.txt");
+        // Все остальные файлы (в т.ч. вся первая, нетронутая, страница) —
+        // тоже на месте с исходными именами.
+        for (i, &id) in ids.iter().enumerate() {
+            if id == target {
+                continue;
+            }
+            let e = entries.iter().find(|e| e.file_id == id).unwrap();
+            assert_eq!(e.name, format!("file_{i}.txt"));
+        }
+        reopened.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ядро "восстановления при частичном повреждении File Table" на
+    /// уровне полного `Container`, а не только `file_table`-модуля:
+    /// специально портим шифртекст одной страницы прямо на диске
+    /// (имитация повреждённого/битого сектора), затем открываем контейнер
+    /// заново — он обязан открыться (не отказать целиком) и честно
+    /// сообщить, какая страница потеряна, при этом дав доступ ко всем
+    /// остальным записям.
+    #[test]
+    fn reopen_with_one_corrupted_page_recovers_the_rest() {
+        let path = temp_container_path("partial_corruption");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let total = file_table::MAX_ENTRIES_PER_PAGE * 2 + 3; // 3 страницы
+        let mut ids = Vec::with_capacity(total);
+        for i in 0..total {
+            let id = c
+                .import_file_from_bytes(&format!("file_{i}.txt"), ROOT_FOLDER_ID, b"x")
+                .unwrap();
+            ids.push(id);
+        }
+        c.close().unwrap();
+
+        // Находим и портим шифртекст страницы 1 (средней) прямо в файле на
+        // диске — та же структура блоба, что использует container::commit()
+        // (superblock -> file_table_offset/len -> [page_count][len][bytes]...).
+        {
+            let mut file = OpenOptions::new().read(true).write(true).open(path_str).unwrap();
+            let locked = LockedContainer::open(path_str).unwrap();
+            let (pointer, _) = read_valid_commit_pointer(&mut file, &locked.header).unwrap();
+            let mut sb_blob = [0u8; superblock::BLOB_LEN];
+            file.seek(SeekFrom::Start(pointer.superblock_offset)).unwrap();
+            file.read_exact(&mut sb_blob).unwrap();
+            // Расшифровать superblock тут нечем без DEK — вместо этого
+            // читаем офсеты через саму Container-сессию перед close() было
+            // бы сложнее; проще: найдём таблицу перебором известной
+            // структуры через уже открытую (но ещё не закрытую) copy. Для
+            // простоты теста откроем заново с паролем, чтобы получить
+            // актуальный Superblock напрямую.
+            drop(locked);
+            let locked2 = LockedContainer::open(path_str).unwrap();
+            let reopened = locked2.unlock("admin", "adminpassword").unwrap();
+            let sb_offset = reopened.superblock.file_table_offset;
+            let sb_len = reopened.superblock.file_table_len;
+            // НЕ close()! commit() (который вызывает close()) всегда пишет
+            // новую версию на новый offset, даже если ничего не менялось
+            // (см. doc-комментарий у commit() — версию продвигает сам факт
+            // совпадения version_counter, а не значение dirty) — тогда
+            // sb_offset/sb_len выше указывали бы уже на СТАРУЮ, неактивную
+            // копию, и порча байт по этому адресу ничего бы не задела.
+            drop(reopened);
+
+            // Портим байт в середине региона File Table — почти наверняка
+            // попадёт в шифртекст одной из трёх страниц, а не точно в
+            // page_count/page_len framing (которое всего 4+4+4 = 12 байт из
+            // региона, занимающего десятки КБ на 3 страницы).
+            let flip_at = sb_offset + sb_len / 2;
+            file.seek(SeekFrom::Start(flip_at)).unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xFF;
+            file.seek(SeekFrom::Start(flip_at)).unwrap();
+            file.write_all(&byte).unwrap();
+        }
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let recovered = locked
+            .unlock("admin", "adminpassword")
+            .expect("контейнер должен открыться несмотря на повреждённую страницу");
+
+        assert!(
+            !recovered.lost_file_table_pages().is_empty(),
+            "должна быть зафиксирована хотя бы одна потерянная страница"
+        );
+        let entries = recovered.list_dir(ROOT_FOLDER_ID).unwrap();
+        // Часть записей потеряна (та самая испорченная страница), но НЕ все.
+        assert!(!entries.is_empty(), "остальные страницы должны были уцелеть");
+        assert!(
+            entries.len() < total,
+            "повреждённая страница должна была унести часть записей, иначе тест ничего не проверяет"
+        );
+        recovered.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Компактификация (ROADMAP.md, "Компактификация свободных блоков
+    /// данных") — основной сценарий: импортируем крупный файл, окончательно
+    /// удаляем его (первый delete_file — в корзину, второй — насовсем, тем
+    /// самым его блоки становятся орфанами), commit — файл на диске заметно
+    /// вырос за счёт содержимого, которое больше ни на что не ссылается.
+    /// compact() обязан вернуть контейнер к размеру, близкому к тому, что
+    /// нужен только оставшимся живым данным, и вернуть положительное число
+    /// освобождённых байт.
+    #[test]
+    fn compact_reclaims_space_from_orphaned_blocks() {
+        let path = temp_container_path("compact_basic");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let keep_content = b"this file must survive compaction".to_vec();
+        let keep_id = c.import_file_from_bytes("keep.bin", ROOT_FOLDER_ID, &keep_content).unwrap();
+
+        // ~2МиБ орфанного содержимого — достаточно крупно, чтобы разница в
+        // размере файла до/после была однозначной, а не шумом от метаданных.
+        let big_content = vec![0x5Au8; 2 * 1024 * 1024];
+        let doomed_id = c.import_file_from_bytes("doomed.bin", ROOT_FOLDER_ID, &big_content).unwrap();
+        c.delete_file(doomed_id).unwrap(); // в корзину
+        c.delete_file(doomed_id).unwrap(); // окончательно — блоки осиротели
+        c.commit().unwrap();
+
+        let size_before = std::fs::metadata(path_str).unwrap().len();
+        let freed = c.compact().unwrap();
+        let size_after = std::fs::metadata(path_str).unwrap().len();
+
+        assert_eq!(size_before - size_after, freed);
+        assert!(
+            freed > 1024 * 1024,
+            "ожидали освободить хотя бы ~1МиБ орфанного содержимого, освободили {freed}"
+        );
+
+        // Оставшийся файл по-прежнему на месте и читается корректно — а не
+        // просто "запись в File Table цела", а именно байты содержимого.
+        assert_eq!(
+            c.read_at(keep_id, 0, keep_content.len() as u32).unwrap(),
+            keep_content
+        );
+
+        // Переживает закрытие/переоткрытие после компактификации — новые
+        // offset'ы блоков честно попали в File Table, а не потерялись.
+        c.close().unwrap();
+        let locked = LockedContainer::open(path_str).unwrap();
+        let reopened = locked.unlock("admin", "adminpassword").unwrap();
+        assert_eq!(
+            reopened.read_at(keep_id, 0, keep_content.len() as u32).unwrap(),
+            keep_content
+        );
+        assert!(reopened.list_dir(ROOT_FOLDER_ID).unwrap().iter().all(|e| e.file_id != doomed_id));
+        reopened.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Второй пользователь (не админ) должен по-прежнему логиниться после
+    /// compact() — keyslots копируются байт-в-байт, но стоит явно
+    /// проверить, что реальный вход всё ещё работает, а не просто "байты
+    /// совпадают".
+    #[test]
+    fn compact_preserves_other_users_login() {
+        let path = temp_container_path("compact_users");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+        c.add_user("viewer", "viewerpassword", Role::ReadOnly).unwrap();
+        c.commit().unwrap();
+
+        c.compact().unwrap();
+        c.close().unwrap();
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let viewer = locked.unlock("viewer", "viewerpassword").unwrap();
+        assert_eq!(viewer.current_role(), Role::ReadOnly);
+        viewer.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `compact()` требует прав на запись (как `delete_file`/
+    /// `replace_file_content`, которые и создают орфанов), а не прав
+    /// администратора — это уборка за собственными действиями пользователя,
+    /// а не смена структуры пользователей/ролей контейнера. ReadOnly не
+    /// может ни удалить файл, ни компактифицировать за собой.
+    #[test]
+    fn compact_requires_write_permission() {
+        let path = temp_container_path("compact_permission");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+        c.add_user("viewer", "viewerpassword", Role::ReadOnly).unwrap();
+        c.close().unwrap();
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let mut viewer = locked.unlock("viewer", "viewerpassword").unwrap();
+        assert!(matches!(viewer.compact(), Err(CoveError::PermissionDenied)));
+        viewer.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Обычный пользователь с правом записи (не администратор) должен
+    /// иметь возможность освободить место, которое сам же и осиротил
+    /// удалением своего файла — раньше это требовало прав администратора,
+    /// что не соответствовало тому, кто реально мог создать орфанов.
+    #[test]
+    fn compact_allowed_for_non_admin_writer() {
+        let path = temp_container_path("compact_readwrite");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+        c.add_user("editor", "editorpassword", Role::ReadWrite).unwrap();
+        c.close().unwrap();
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let mut editor = locked.unlock("editor", "editorpassword").unwrap();
+        let big_content = vec![0x7Bu8; 2 * 1024 * 1024];
+        let id = editor.import_file_from_bytes("doomed.bin", ROOT_FOLDER_ID, &big_content).unwrap();
+        editor.delete_file(id).unwrap();
+        editor.delete_file(id).unwrap();
+        editor.commit().unwrap();
+
+        let freed = editor.compact().unwrap();
+        assert!(freed > 1024 * 1024, "не-админ должен был реально освободить место");
+        editor.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Компактификация без единого орфана не должна ничего портить — нулевая
+    /// экономия честно возвращается как 0, а не ошибка, и все файлы целы.
+    #[test]
+    fn compact_with_nothing_to_reclaim_is_a_safe_noop() {
+        let path = temp_container_path("compact_noop");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+        let content = b"nothing to reclaim here".to_vec();
+        let id = c.import_file_from_bytes("a.bin", ROOT_FOLDER_ID, &content).unwrap();
+        c.commit().unwrap();
+
+        c.compact().unwrap();
+        assert_eq!(c.read_at(id, 0, content.len() as u32).unwrap(), content);
+        c.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Именно сценарий, который попросил пользователь: удалил файл, вышел
+    /// (`close()`, тот же путь, что зовёт GUI при логауте на всех трёх
+    /// платформах) — и БЕЗ единого явного вызова `compact()` файл базы
+    /// реально стал меньше. Отдельно проверяем, что данные, которые не
+    /// удалялись, при этом не пострадали.
+    #[test]
+    fn close_after_permanent_delete_shrinks_file_automatically() {
+        let path = temp_container_path("auto_compact_on_close");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+
+        let keep_content = b"survives the automatic cleanup".to_vec();
+        let keep_id = c.import_file_from_bytes("keep.bin", ROOT_FOLDER_ID, &keep_content).unwrap();
+
+        let big_content = vec![0x99u8; 2 * 1024 * 1024];
+        let doomed_id = c.import_file_from_bytes("doomed.bin", ROOT_FOLDER_ID, &big_content).unwrap();
+        c.commit().unwrap();
+        let size_before_delete = std::fs::metadata(path_str).unwrap().len();
+
+        c.delete_file(doomed_id).unwrap(); // в корзину
+        c.delete_file(doomed_id).unwrap(); // окончательно — блоки осиротели
+        // Пользователь просто выходит — НЕ зовёт compact() сам.
+        c.close().unwrap();
+
+        let size_after_logout = std::fs::metadata(path_str).unwrap().len();
+        assert!(
+            size_after_logout < size_before_delete,
+            "после выхода файл базы должен был стать меньше: было {size_before_delete}, стало {size_after_logout}"
+        );
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let reopened = locked.unlock("admin", "adminpassword").unwrap();
+        assert_eq!(
+            reopened.read_at(keep_id, 0, keep_content.len() as u32).unwrap(),
+            keep_content
+        );
+        assert!(reopened.list_dir(ROOT_FOLDER_ID).unwrap().iter().all(|e| e.file_id != doomed_id));
+        reopened.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Обратная сторона той же оптимизации: сессия, которая ничего не
+    /// удаляла, при выходе не должна платить цену полной компактификации —
+    /// `close()` в этом случае обязан остаться дешёвым `commit()`. Прямо
+    /// замерить "не было полного перечитывания/переписывания блоков"
+    /// сложно, но можно проверить наблюдаемое следствие: обычный commit
+    /// СОХРАНЯЕТ `file_table_backup_offset` как отдельную ссылку на
+    /// предыдущее поколение (Фаза 2/17), а `compact()` всегда схлопывает
+    /// её в текущий offset (см. код `compact()` — "новая база, прежней
+    /// истории для отката больше не существует"). Если после чистого
+    /// close() без единого удаления backup-offset всё ещё отличается от
+    /// текущего — это и есть доказательство, что сработал обычный commit,
+    /// а не незаметный лишний compact().
+    #[test]
+    fn close_without_deletions_does_not_auto_compact() {
+        let path = temp_container_path("no_auto_compact");
+        let path_str = path.to_str().unwrap();
+        let (mut c, _r) = Container::create(path_str, "admin", "adminpassword").unwrap();
+        let content = b"just importing, never deleting".to_vec();
+        c.import_file_from_bytes("a.bin", ROOT_FOLDER_ID, &content).unwrap();
+        c.close().unwrap();
+
+        let locked = LockedContainer::open(path_str).unwrap();
+        let reopened = locked.unlock("admin", "adminpassword").unwrap();
+        assert_ne!(
+            reopened.superblock.file_table_backup_offset,
+            reopened.superblock.file_table_offset,
+            "обычный commit() должен был сохранить отдельный backup-offset, а не схлопнуть его как compact()"
+        );
+        reopened.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }

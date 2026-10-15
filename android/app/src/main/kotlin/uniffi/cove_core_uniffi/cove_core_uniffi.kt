@@ -780,6 +780,14 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -809,6 +817,10 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_close_container(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_commit(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_compact(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_create_folder(`ptr`: Pointer,`name`: RustBuffer.ByValue,`parentId`: Long,`category`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_current_role(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -835,10 +847,14 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_login_history(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_lost_file_table_pages(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_move_file(`ptr`: Pointer,`fileId`: Long,`newParent`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_read_at(`ptr`: Pointer,`fileId`: Long,`offset`: Long,`len`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_cove_core_uniffi_fn_method_androidcontainer_reload(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_remove_user(`ptr`: Pointer,`username`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_cove_core_uniffi_fn_method_androidcontainer_rename_file(`ptr`: Pointer,`fileId`: Long,`newName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -993,6 +1009,10 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_close_container(
     ): Short
+    fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_commit(
+    ): Short
+    fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_compact(
+    ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_create_folder(
     ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_current_role(
@@ -1019,9 +1039,13 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_login_history(
     ): Short
+    fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_lost_file_table_pages(
+    ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_move_file(
     ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_read_at(
+    ): Short
+    fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_reload(
     ): Short
     fun uniffi_cove_core_uniffi_checksum_method_androidcontainer_remove_user(
     ): Short
@@ -1079,6 +1103,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_close_container() != 13478.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_commit() != 34941.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_compact() != 28036.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_create_folder() != 45696.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1118,10 +1148,16 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_login_history() != 21288.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_lost_file_table_pages() != 33705.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_move_file() != 26646.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_read_at() != 32932.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_reload() != 11811.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cove_core_uniffi_checksum_method_androidcontainer_remove_user() != 2149.toShort()) {
@@ -1536,6 +1572,26 @@ public interface AndroidContainerInterface {
      */
     fun `closeContainer`()
     
+    /**
+     * Пишет текущее состояние на диск, не закрывая контейнер — по прямому
+     * запросу пользователя: раньше изменения были видны другой открытой
+     * сессии (например, веб-версии на другом устройстве через тот же файл
+     * в облачной синхронизации) только после полного close_container().
+     * UI зовёт это после каждого пользовательского действия, не после
+     * каждого файла в batch-импорте (полное перекодирование File Table на
+     * каждый файл было бы квадратичным по времени).
+     */
+    fun `commit`()
+    
+    /**
+     * Компактификация (ROADMAP.md, "Компактификация свободных блоков") —
+     * физически пересобирает файл-контейнер, отбрасывая орфанные блоки
+     * удалённых/перезаписанных файлов и старые поколения File Table.
+     * Требует прав администратора, дорогая операция — вызывается вручную,
+     * не автоматически. Возвращает число освобождённых байт.
+     */
+    fun `compact`(): kotlin.ULong
+    
     fun `createFolder`(`name`: kotlin.String, `parentId`: kotlin.ULong, `category`: kotlin.String?): kotlin.ULong
     
     fun `currentRole`(): Role
@@ -1570,9 +1626,26 @@ public interface AndroidContainerInterface {
     
     fun `loginHistory`(): List<LoginLogEntry>
     
+    /**
+     * Номера страниц File Table, которые не удалось расшифровать при
+     * последней загрузке (unlock/reload) — пусто в норме. Позволяет UI
+     * честно предупредить о частичной потере данных вместо того, чтобы
+     * молча показать неполную библиотеку (ROADMAP.md, "Восстановление при
+     * частичном повреждении File Table"). `usize` не является FFI-типом
+     * UniFFI — индексы страниц всегда умещаются в u32.
+     */
+    fun `lostFileTablePages`(): List<kotlin.UInt>
+    
     fun `moveFile`(`fileId`: kotlin.ULong, `newParent`: kotlin.ULong)
     
     fun `readAt`(`fileId`: kotlin.ULong, `offset`: kotlin.ULong, `len`: kotlin.UInt): kotlin.ByteArray
+    
+    /**
+     * Перечитывает File Table с диска, если там более новая версия —
+     * пароль не нужен, DEK уже в памяти. Возвращает true, если состояние
+     * действительно обновилось.
+     */
+    fun `reload`(): kotlin.Boolean
     
     fun `removeUser`(`username`: kotlin.String)
     
@@ -1728,6 +1801,47 @@ open class AndroidContainer: Disposable, AutoCloseable, AndroidContainerInterfac
 }
     }
     
+    
+
+    
+    /**
+     * Пишет текущее состояние на диск, не закрывая контейнер — по прямому
+     * запросу пользователя: раньше изменения были видны другой открытой
+     * сессии (например, веб-версии на другом устройстве через тот же файл
+     * в облачной синхронизации) только после полного close_container().
+     * UI зовёт это после каждого пользовательского действия, не после
+     * каждого файла в batch-импорте (полное перекодирование File Table на
+     * каждый файл было бы квадратичным по времени).
+     */
+    @Throws(AndroidException::class)override fun `commit`()
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(AndroidException) { _status ->
+    UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_commit(
+        it, _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Компактификация (ROADMAP.md, "Компактификация свободных блоков") —
+     * физически пересобирает файл-контейнер, отбрасывая орфанные блоки
+     * удалённых/перезаписанных файлов и старые поколения File Table.
+     * Требует прав администратора, дорогая операция — вызывается вручную,
+     * не автоматически. Возвращает число освобождённых байт.
+     */
+    @Throws(AndroidException::class)override fun `compact`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCallWithError(AndroidException) { _status ->
+    UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_compact(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     
@@ -1906,6 +2020,27 @@ open class AndroidContainer: Disposable, AutoCloseable, AndroidContainerInterfac
     
 
     
+    /**
+     * Номера страниц File Table, которые не удалось расшифровать при
+     * последней загрузке (unlock/reload) — пусто в норме. Позволяет UI
+     * честно предупредить о частичной потере данных вместо того, чтобы
+     * молча показать неполную библиотеку (ROADMAP.md, "Восстановление при
+     * частичном повреждении File Table"). `usize` не является FFI-типом
+     * UniFFI — индексы страниц всегда умещаются в u32.
+     */
+    @Throws(AndroidException::class)override fun `lostFileTablePages`(): List<kotlin.UInt> {
+            return FfiConverterSequenceUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(AndroidException) { _status ->
+    UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_lost_file_table_pages(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
     @Throws(AndroidException::class)override fun `moveFile`(`fileId`: kotlin.ULong, `newParent`: kotlin.ULong)
         = 
     callWithPointer {
@@ -1924,6 +2059,24 @@ open class AndroidContainer: Disposable, AutoCloseable, AndroidContainerInterfac
     uniffiRustCallWithError(AndroidException) { _status ->
     UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_read_at(
         it, FfiConverterULong.lower(`fileId`),FfiConverterULong.lower(`offset`),FfiConverterUInt.lower(`len`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Перечитывает File Table с диска, если там более новая версия —
+     * пароль не нужен, DEK уже в памяти. Возвращает true, если состояние
+     * действительно обновилось.
+     */
+    @Throws(AndroidException::class)override fun `reload`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(AndroidException) { _status ->
+    UniffiLib.INSTANCE.uniffi_cove_core_uniffi_fn_method_androidcontainer_reload(
+        it, _status)
 }
     }
     )
@@ -2604,6 +2757,14 @@ sealed class AndroidException(message: String): kotlin.Exception(message) {
         
         class Closed(message: String) : AndroidException(message)
         
+    /**
+     * Другая одновременно открытая сессия того же контейнера уже
+     * закоммитила изменения после последней синхронизации этой сессии —
+     * см. cove_core::CoveError::Conflict. UI должен предложить перезайти,
+     * а не молча игнорировать или слепо повторять commit().
+     */
+        class Conflict(message: String) : AndroidException(message)
+        
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<AndroidException> {
         override fun lift(error_buf: RustBuffer.ByValue): AndroidException = FfiConverterTypeAndroidError.lift(error_buf)
@@ -2624,6 +2785,7 @@ public object FfiConverterTypeAndroidError : FfiConverterRustBuffer<AndroidExcep
             5 -> AndroidException.AlreadyExists(FfiConverterString.read(buf))
             6 -> AndroidException.PermissionDenied(FfiConverterString.read(buf))
             7 -> AndroidException.Closed(FfiConverterString.read(buf))
+            8 -> AndroidException.Conflict(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
         
@@ -2661,6 +2823,10 @@ public object FfiConverterTypeAndroidError : FfiConverterRustBuffer<AndroidExcep
             }
             is AndroidException.Closed -> {
                 buf.putInt(7)
+                Unit
+            }
+            is AndroidException.Conflict -> {
+                buf.putInt(8)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2791,6 +2957,34 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
+    override fun read(buf: ByteBuffer): List<kotlin.UInt> {
+        val len = buf.getInt()
+        return List<kotlin.UInt>(len) {
+            FfiConverterUInt.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.UInt>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterUInt.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.UInt>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterUInt.write(it, buf)
         }
     }
 }

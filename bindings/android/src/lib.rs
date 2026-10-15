@@ -38,6 +38,12 @@ pub enum AndroidError {
     PermissionDenied,
     #[error("container already closed")]
     Closed,
+    /// Другая одновременно открытая сессия того же контейнера уже
+    /// закоммитила изменения после последней синхронизации этой сессии —
+    /// см. cove_core::CoveError::Conflict. UI должен предложить перезайти,
+    /// а не молча игнорировать или слепо повторять commit().
+    #[error("stale session: on-disk version has moved since last sync")]
+    Conflict,
 }
 
 impl From<cove_core::CoveError> for AndroidError {
@@ -49,6 +55,7 @@ impl From<cove_core::CoveError> for AndroidError {
             ErrorCategory::NotFound => AndroidError::NotFound,
             ErrorCategory::AlreadyExists => AndroidError::AlreadyExists,
             ErrorCategory::PermissionDenied => AndroidError::PermissionDenied,
+            ErrorCategory::Conflict => AndroidError::Conflict,
         }
     }
 }
@@ -414,5 +421,42 @@ impl AndroidContainer {
             Some(c) => Ok(c.close()?),
             None => Ok(()),
         }
+    }
+
+    /// Пишет текущее состояние на диск, не закрывая контейнер — по прямому
+    /// запросу пользователя: раньше изменения были видны другой открытой
+    /// сессии (например, веб-версии на другом устройстве через тот же файл
+    /// в облачной синхронизации) только после полного close_container().
+    /// UI зовёт это после каждого пользовательского действия, не после
+    /// каждого файла в batch-импорте (полное перекодирование File Table на
+    /// каждый файл было бы квадратичным по времени).
+    fn commit(&self) -> Result<(), AndroidError> {
+        self.with_mut(|c| c.commit())
+    }
+
+    /// Перечитывает File Table с диска, если там более новая версия —
+    /// пароль не нужен, DEK уже в памяти. Возвращает true, если состояние
+    /// действительно обновилось.
+    fn reload(&self) -> Result<bool, AndroidError> {
+        self.with_mut(|c| c.reload())
+    }
+
+    /// Компактификация (ROADMAP.md, "Компактификация свободных блоков") —
+    /// физически пересобирает файл-контейнер, отбрасывая орфанные блоки
+    /// удалённых/перезаписанных файлов и старые поколения File Table.
+    /// Требует прав администратора, дорогая операция — вызывается вручную,
+    /// не автоматически. Возвращает число освобождённых байт.
+    fn compact(&self) -> Result<u64, AndroidError> {
+        self.with_mut(|c| c.compact())
+    }
+
+    /// Номера страниц File Table, которые не удалось расшифровать при
+    /// последней загрузке (unlock/reload) — пусто в норме. Позволяет UI
+    /// честно предупредить о частичной потере данных вместо того, чтобы
+    /// молча показать неполную библиотеку (ROADMAP.md, "Восстановление при
+    /// частичном повреждении File Table"). `usize` не является FFI-типом
+    /// UniFFI — индексы страниц всегда умещаются в u32.
+    fn lost_file_table_pages(&self) -> Result<Vec<u32>, AndroidError> {
+        self.with(|c| Ok(c.lost_file_table_pages().iter().map(|&p| p as u32).collect()))
     }
 }
