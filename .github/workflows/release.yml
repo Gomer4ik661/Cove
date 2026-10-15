@@ -30,6 +30,16 @@ jobs:
       - name: cove_core_py.so под плоским именем (см. scripts/build_python_bindings.sh)
         run: cp target/release/libcove_core_py.so desktop/cove_core_py.so
 
+      # cove-web-backend — отдельный бинарник для вкладки "Веб" настроек
+      # (desktop/app/web_server.py), не Python-расширение. Без этого шага
+      # desktop/cove.spec падает с ошибкой "не найден" (см. комментарий
+      # там же) — нашлось вживую в собранном пользователем AppImage.
+      - name: cargo build cove-web-backend (release)
+        run: cargo build --release -p cove-web-backend
+
+      - name: cove-web-backend под плоским именем (см. scripts/build_web_backend.sh)
+        run: cp target/release/cove-web-backend desktop/cove-web-backend
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -80,6 +90,13 @@ jobs:
       - name: cove_core_py.pyd под плоским именем
         shell: pwsh
         run: Copy-Item target\release\cove_core_py.dll desktop\cove_core_py.pyd
+
+      - name: cargo build cove-web-backend (release)
+        run: cargo build --release -p cove-web-backend
+
+      - name: cove-web-backend.exe под плоским именем
+        shell: pwsh
+        run: Copy-Item target\release\cove-web-backend.exe desktop\cove-web-backend.exe
 
       - uses: actions/setup-python@v5
         with:
@@ -136,6 +153,17 @@ jobs:
         run: |
           chmod +x scripts/build_android_bindings.sh
           ./scripts/build_android_bindings.sh
+
+      # Без этого шага libcove_web_backend.so в jniLibs не появляется —
+      # release-APK до этого фикса собирался без веб-доступа вообще,
+      # несмотря на то что WebServerService.kt полностью реализован и
+      # протестирован (найдено при финальной проверке перед публикацией,
+      # не вживую на устройстве — там бинарник брался уже собранным
+      # локально этим же скриптом).
+      - name: cargo build cove-web-backend под Android (scripts/build_web_backend_android.sh)
+        run: |
+          chmod +x scripts/build_web_backend_android.sh
+          ./scripts/build_web_backend_android.sh
 
       - name: release.keystore из GitHub Secrets
         working-directory: android
