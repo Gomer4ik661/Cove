@@ -22,6 +22,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.AlertDialog
@@ -67,11 +69,14 @@ import com.cove.app.media.decodeBitmap
 import com.cove.app.media.exportForExternalOpen
 import com.cove.app.media.generateThumbnailBytes
 import com.cove.app.media.kindOf
+import com.cove.app.UserActivity
 import com.cove.app.media.launchExternalViewIntent
+import com.cove.app.storage.AppSettings
 import com.cove.app.storage.ThemeMode
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -90,7 +95,15 @@ private sealed class Section(val title: String) {
     data object Root : Section("Библиотека")
     data class Category(val label: String, val category: String) : Section(label)
     data object Favorites : Section("Избранное")
+    data object Recent : Section("Недавние")
+    data object Trash : Section("Корзина")
 }
+
+// Та же граница, что Desktop main_window.py (RECENT_LIMIT) — "Недавние"
+// не отдельный индекс, а полный search() с сортировкой и обрезкой на
+// клиенте, безлимитный список был бы бессмысленным UX для раздела,
+// задуманного как "последнее".
+private const val RECENT_LIMIT = 50
 
 private val DRAWER_CATEGORIES = listOf(
     "Фото" to "image",
@@ -103,17 +116,34 @@ private val DRAWER_CATEGORIES = listOf(
 fun LibraryScreen(
     container: AndroidContainer,
     containerPath: String,
+    appSettings: AppSettings,
     themeMode: ThemeMode,
     onThemeModeChange: (ThemeMode) -> Unit,
     onLogout: () -> Unit,
+    onDatabaseDeleted: () -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
     if (showSettings) {
+        val scope = rememberCoroutineScope()
         SettingsScreen(
             containerPath = containerPath,
             themeMode = themeMode,
             onThemeModeChange = onThemeModeChange,
             onBack = { showSettings = false },
+            onDeleteDatabase = {
+                // Тот же порядок, что и у обычного "Выхода" ниже: сначала
+                // честно закрываем Container (это и есть commit на диск),
+                // потом удаляем сам файл — если удалить раньше закрытия,
+                // AndroidContainer может попытаться дописать что-то в уже
+                // не существующий файл.
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        container.closeContainer()
+                        File(containerPath).delete()
+                    }
+                    onDatabaseDeleted()
+                }
+            },
         )
         return
     }
@@ -135,6 +165,13 @@ fun LibraryScreen(
     }
 
     var section by remember { mutableStateOf<Section>(Section.Root) }
+    // Поиск по имени — как Desktop main_window.py (search_edit): пустой
+    // текст = обычный listDir/раздел, непустой = container.search()
+    // рекурсивно внутри текущей папки (Root/Category) или поверх самого
+    // раздела (Избранное/Недавние). Раньше на Android search() вызывался
+    // только для фильтра "Избранное" — строки поиска не было вообще.
+    var searchActive by remember { mutableStateOf(false) }
+    var searchText by remember { mutableStateOf("") }
     var folderStack by remember { mutableStateOf(listOf(FolderCrumb(0uL, "Библиотека"))) }
     var entries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -144,6 +181,12 @@ fun LibraryScreen(
     var refreshKey by remember { mutableStateOf(0) }
     var exportTarget by remember { mutableStateOf<FileEntry?>(null) }
     var externalOpenTarget by remember { mutableStateOf<FileEntry?>(null) }
+    // Подтверждение перед удалением (раньше тап по иконке удалял мгновенно,
+    // без единого диалога — см. docs/FUTURE_IMPROVEMENTS.md). Само удаление
+    // смотрит на текущий section в момент подтверждения: в Корзине
+    // deleteFile() на уже trashed-записи — окончательное удаление
+    // (core/src/container/mod.rs), поэтому текст диалога здесь другой.
+    var deleteTarget by remember { mutableStateOf<FileEntry?>(null) }
     // Кэш декодированных миниатюр на время сессии экрана — без него каждый
     // повторный вход строки фото в композицию (например, при скролле назад)
     // заново гонял бы decode+readAt.
@@ -181,6 +224,47 @@ fun LibraryScreen(
         refreshKey++
     }
 
+    // Общий путь выхода — и для кнопки "Выход", и для автоблокировки по
+    // простою ниже: тот же порядок (дождаться незавершённых записей, затем
+    // closeContainer/commit), иначе автоблокировка рисковала бы той же
+    // гонкой с потерей файла, что уже чинили для обычного выхода (см.
+    // комментарий у pendingWrites).
+    var loggingOut by remember { mutableStateOf(false) }
+    fun performLogout() {
+        if (loggingOut) return
+        loggingOut = true
+        scope.launch {
+            pendingWrites.toList().joinAll()
+            withContext(Dispatchers.IO) { container.closeContainer() }
+            onLogout()
+        }
+    }
+
+    // Живая синхронизация с другими сессиями на том же контейнере — по
+    // прямому запросу пользователя, после того как выяснилось, что файл,
+    // загруженный через собственный веб-сервер Android (ROADMAP.md,
+    // "веб-морда в Android"), не появлялся в уже открытом списке без
+    // выхода и повторного входа. `AndroidContainer.reload()` был в
+    // биндингах с самого начала для единообразия API с Desktop/Web, но
+    // сознательно не подключался к UI — просили только Desktop↔Web. Тот же
+    // принцип, что и Desktop-таймер (main_window.py, _reload_and_refresh):
+    // reload() — дешёвый no-op, если версия на диске не изменилась.
+    // Conflict (у ЭТОЙ сессии есть свои несохранённые правки прямо в
+    // момент опроса — редкое окно между локальным действием и его
+    // commitQuietly()) — не ошибка, просто пропускаем тик.
+    // `force = true` — для кнопки "Обновить": в отличие от тихого таймера,
+    // клик должен ощутимо на что-то реагировать, даже если reload() не
+    // нашёл новой версии на диске (тот же выбор, что и Desktop
+    // _manual_refresh() против _reload_and_refresh()).
+    suspend fun reloadAndRefresh(force: Boolean = false) {
+        val changed = try {
+            withContext(Dispatchers.IO) { container.reload() }
+        } catch (_: AndroidException) {
+            false
+        }
+        if (changed || force) refresh()
+    }
+
     fun openFile(entry: FileEntry) {
         if (kindOf(entry.name) == FileKind.UNKNOWN) {
             externalOpenTarget = entry
@@ -192,6 +276,14 @@ fun LibraryScreen(
     fun selectSection(target: Section) {
         section = target
         folderStack = listOf(FolderCrumb(0uL, "Библиотека"))
+        // Поиск в Корзине не имеет смысла (listTrash() его не учитывает,
+        // как и Desktop, где строка поиска прямо отключена в этом
+        // разделе) — закрываем, чтобы не оставлять бесполезное открытое
+        // поле ввода.
+        if (target is Section.Trash) {
+            searchActive = false
+            searchText = ""
+        }
         scope.launch { drawerState.close() }
     }
 
@@ -229,6 +321,13 @@ fun LibraryScreen(
                             tempFile.outputStream().use { output -> input.copyTo(output) }
                         } ?: throw IllegalStateException("не удалось открыть файл")
                         container.importFile(tempFile.absolutePath, currentFolder.id)
+                        // По прямому запросу пользователя: раньше импорт был
+                        // виден другой одновременно открытой сессии (Desktop/
+                        // Web на том же контейнере) только после полного
+                        // closeContainer() — здесь пикер отдаёт один файл за
+                        // раз, так что commit() на каждый вызов не создаёт
+                        // квадратичной стоимости, в отличие от batch-импорта.
+                        commitQuietly(container)
                     } finally {
                         importDir.deleteRecursively()
                     }
@@ -267,12 +366,21 @@ fun LibraryScreen(
         exportTarget?.let { exportLauncher.launch(it.name) }
     }
 
-    LaunchedEffect(section, currentFolder.id, refreshKey) {
+    LaunchedEffect(section, currentFolder.id, refreshKey, searchText) {
         loading = true
         try {
+            // Пустая строка -> null, как Desktop (search_text or None) —
+            // "искать пустую подстроку" означает "показать всё", так что
+            // проще явно отключить поиск и идти обычным путём (listDir
+            // быстрее, чем search() по всей File Table).
+            val query = searchText.trim().ifBlank { null }
             entries = withContext(Dispatchers.IO) {
                 when (val current = section) {
-                    is Section.Root -> container.listDir(currentFolder.id)
+                    is Section.Root -> if (query == null) {
+                        container.listDir(currentFolder.id)
+                    } else {
+                        container.search(SearchQuery(nameContains = query, folderId = currentFolder.id))
+                    }
                     // Та же навигация по папкам, что и в Root, с фильтром на
                     // клиенте. Папки фильтруются по folderCategory — тегу,
                     // который папка получает один раз при создании (в какой
@@ -282,12 +390,20 @@ fun LibraryScreen(
                     // "утекать" в "Видео"/"Документы", даже если разово в
                     // неё попадёт видео). Файлы — по фактическому
                     // расширению, как и раньше.
-                    is Section.Category -> container.listDir(currentFolder.id)
-                        .filter {
-                            (it.isFolder && it.folderCategory == current.category) ||
-                                (!it.isFolder && categoryOf(it.name) == current.category)
-                        }
-                    is Section.Favorites -> container.search(SearchQuery(favorite = true))
+                    is Section.Category -> if (query == null) {
+                        container.listDir(currentFolder.id)
+                            .filter {
+                                (it.isFolder && it.folderCategory == current.category) ||
+                                    (!it.isFolder && categoryOf(it.name) == current.category)
+                            }
+                    } else {
+                        container.search(SearchQuery(nameContains = query, folderId = currentFolder.id, category = current.category))
+                    }
+                    is Section.Favorites -> container.search(SearchQuery(nameContains = query, favorite = true))
+                    is Section.Recent -> container.search(SearchQuery(nameContains = query))
+                        .sortedByDescending { it.modifiedAt }
+                        .take(RECENT_LIMIT)
+                    is Section.Trash -> container.listTrash()
                 }
             }
             error = null
@@ -295,6 +411,38 @@ fun LibraryScreen(
             error = "Не удалось загрузить список: ${e.message}"
         }
         loading = false
+    }
+
+    // Опрос раз в 3с, пока виден список библиотеки (пауза, пока открыты
+    // Настройки/просмотрщик — им обновлённый список не нужен, и при
+    // возврате сюда композиция этого LaunchedEffect всё равно перезапустится
+    // заново). См. reloadAndRefresh() выше.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(3000)
+            reloadAndRefresh()
+        }
+    }
+
+    // Автоблокировка по простою — то же самое, что Desktop
+    // main_window.py::_auto_lock_timer, но раньше на Android такого не
+    // было вообще (см. docs/FUTURE_IMPROVEMENTS.md): разблокированное
+    // хранилище никогда не блокировалось само. Читаем настройку заново на
+    // каждом тике (а не один раз в remember) — изменение в Настройках
+    // должно подействовать сразу, без выхода и повторного входа.
+    // UserActivity.lastInteractionAtMillis обновляется из
+    // MainActivity.dispatchTouchEvent() и видит любой тач, в том числе
+    // внутри диалогов/дровера.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(15_000)
+            val minutes = appSettings.autoLockMinutes()
+            val idleMs = System.currentTimeMillis() - UserActivity.lastInteractionAtMillis
+            if (minutes > 0 && idleMs >= minutes * 60_000L) {
+                performLogout()
+                break
+            }
+        }
     }
 
     ModalNavigationDrawer(
@@ -326,6 +474,23 @@ fun LibraryScreen(
                     onClick = { selectSection(Section.Favorites) },
                     modifier = Modifier.padding(horizontal = 12.dp),
                 )
+                NavigationDrawerItem(
+                    label = { Text("Недавние") },
+                    selected = section is Section.Recent,
+                    onClick = { selectSection(Section.Recent) },
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                )
+                // Корзина — до этого экран был вообще, listTrash()/restoreFile()
+                // существовали в биндингах, но не вызывались ни отсюда, ни
+                // откуда-либо ещё: удаление на Android выглядело как обычное
+                // "удалить", но без подтверждения и без единого способа
+                // увидеть или вернуть файл с телефона (см. docs/FUTURE_IMPROVEMENTS.md).
+                NavigationDrawerItem(
+                    label = { Text("Корзина") },
+                    selected = section is Section.Trash,
+                    onClick = { selectSection(Section.Trash) },
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                )
                 HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
                 NavigationDrawerItem(
                     label = { Text("Настройки") },
@@ -343,13 +508,25 @@ fun LibraryScreen(
             topBar = {
                 TopAppBar(
                     title = {
-                        Text(
-                            when (section) {
-                                is Section.Root -> folderStack.joinToString(" / ") { it.name }
-                                is Section.Category -> section.title + " / " + folderStack.joinToString(" / ") { it.name }
-                                is Section.Favorites -> section.title
-                            },
-                        )
+                        if (searchActive) {
+                            OutlinedTextField(
+                                value = searchText,
+                                onValueChange = { searchText = it },
+                                placeholder = { Text("Поиск по имени…") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            Text(
+                                when (section) {
+                                    is Section.Root -> folderStack.joinToString(" / ") { it.name }
+                                    is Section.Category -> section.title + " / " + folderStack.joinToString(" / ") { it.name }
+                                    is Section.Favorites -> section.title
+                                    is Section.Recent -> section.title
+                                    is Section.Trash -> section.title
+                                },
+                            )
+                        }
                     },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
@@ -362,26 +539,29 @@ fun LibraryScreen(
                                 Text("Назад")
                             }
                         }
-                        TextButton(onClick = {
-                            // create_folder/delete_file и т.п. в Core только мутируют
-                            // File Table в памяти — реальный commit на диск происходит
-                            // в close(). Если не дождаться его перед сменой экрана,
-                            // процесс может быть убит раньше, чем commit случится, и
-                            // несохранённые изменения потеряются (найдено вживую: после
-                            // удаления папки и быстрого выхода она "возвращалась").
-                            //
-                            // Мало дождаться самого close() — сначала обязательно
-                            // дождаться ВСЕХ ещё не завершившихся launchWrite()
-                            // (например, импорт файла, запущенный за миг до тапа на
-                            // "Выход"): иначе close() может выполниться раньше и
-                            // забрать container из Mutex, и незавершённый импорт
-                            // молча потеряет файл (см. комментарий у pendingWrites).
-                            scope.launch {
-                                pendingWrites.toList().joinAll()
-                                withContext(Dispatchers.IO) { container.closeContainer() }
-                                onLogout()
+                        // Поиск отключён в Корзине — как на Desktop (там
+                        // строка поиска прямо задизейблена для раздела
+                        // "Корзина"); listTrash() не принимает SearchQuery.
+                        if (section !is Section.Trash) {
+                            IconButton(onClick = {
+                                if (searchActive) searchText = ""
+                                searchActive = !searchActive
+                            }) {
+                                Icon(Icons.Filled.Search, contentDescription = "Поиск")
                             }
-                        }) { Text("Выход") }
+                        }
+                        IconButton(onClick = { scope.launch { reloadAndRefresh(force = true) } }) {
+                            Icon(Icons.Filled.Refresh, contentDescription = "Обновить")
+                        }
+                        // create_folder/delete_file и т.п. в Core только мутируют File
+                        // Table в памяти — реальный commit на диск происходит в close().
+                        // performLogout() (объявлена выше) дожидается и незавершённых
+                        // launchWrite(), и самого closeContainer() — иначе процесс мог
+                        // быть убит раньше, чем commit случится (найдено вживую: после
+                        // удаления папки и быстрого выхода она "возвращалась"), см.
+                        // комментарий у pendingWrites. Теперь тот же путь используется
+                        // и автоблокировкой по простою.
+                        TextButton(onClick = { performLogout() }) { Text("Выход") }
                     },
                 )
             },
@@ -450,6 +630,7 @@ fun LibraryScreen(
                                 container = container,
                                 entry = entry,
                                 thumbnailCache = thumbnailCache,
+                                inTrash = section is Section.Trash,
                                 onClick = {
                                     if (entry.isFolder) {
                                         if (section is Section.Root || section is Section.Category) {
@@ -464,6 +645,7 @@ fun LibraryScreen(
                                         try {
                                             withContext(Dispatchers.IO) {
                                                 container.setFavorite(entry.fileId, !entry.favorite)
+                                                commitQuietly(container)
                                             }
                                             refresh()
                                         } catch (_: AndroidException) {
@@ -471,13 +653,17 @@ fun LibraryScreen(
                                         }
                                     }
                                 },
-                                onDelete = {
+                                onDelete = { deleteTarget = entry },
+                                onRestore = {
                                     launchWrite {
                                         try {
-                                            withContext(Dispatchers.IO) { container.deleteFile(entry.fileId) }
+                                            withContext(Dispatchers.IO) {
+                                                container.restoreFile(entry.fileId)
+                                                commitQuietly(container)
+                                            }
                                             refresh()
                                         } catch (e: AndroidException) {
-                                            error = "Не удалось удалить: ${e.message}"
+                                            error = "Не удалось восстановить: ${e.message}"
                                         }
                                     }
                                 },
@@ -503,6 +689,7 @@ fun LibraryScreen(
                             try {
                                 withContext(Dispatchers.IO) {
                                     container.createFolder(name, currentFolder.id, category)
+                                    commitQuietly(container)
                                 }
                                 refresh()
                             } catch (e: AndroidException) {
@@ -544,6 +731,48 @@ fun LibraryScreen(
                     },
                 )
             }
+
+            val toDelete = deleteTarget
+            if (toDelete != null) {
+                val permanent = section is Section.Trash
+                AlertDialog(
+                    onDismissRequest = { deleteTarget = null },
+                    title = { Text(if (permanent) "Удалить «${toDelete.name}» навсегда?" else "Удалить «${toDelete.name}»?") },
+                    text = {
+                        Text(
+                            if (permanent) {
+                                "Это необратимо — файл будет невозможно восстановить."
+                            } else {
+                                "Файл переместится в Корзину, его можно будет восстановить."
+                            },
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            deleteTarget = null
+                            launchWrite {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        container.deleteFile(toDelete.fileId)
+                                        commitQuietly(container)
+                                    }
+                                    refresh()
+                                } catch (e: AndroidException) {
+                                    error = "Не удалось удалить: ${e.message}"
+                                }
+                            }
+                        }) {
+                            Text(
+                                if (permanent) "Удалить навсегда" else "Удалить",
+                                color = if (permanent) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                            )
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { deleteTarget = null }) { Text("Отмена") }
+                    },
+                )
+            }
         }
     }
 }
@@ -553,9 +782,11 @@ private fun FileRow(
     container: AndroidContainer,
     entry: FileEntry,
     thumbnailCache: androidx.compose.runtime.snapshots.SnapshotStateMap<ULong, ImageBitmap>,
+    inTrash: Boolean,
     onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
     onDelete: () -> Unit,
+    onRestore: () -> Unit,
     onExport: () -> Unit,
 ) {
     // Миниатюра — только для фото: находим уже сгенерированную (findThumbnail)
@@ -617,7 +848,14 @@ private fun FileRow(
                 Text(friendlySize(entry.size), style = MaterialTheme.typography.bodySmall)
             }
         }
-        if (!entry.isFolder) {
+        // В Корзине — только восстановить/удалить навсегда, как в desktop
+        // (контекстное меню там для trashed-записи предлагает ровно это
+        // же, без избранного/экспорта).
+        if (inTrash) {
+            IconButton(onClick = onRestore) {
+                Text("↺", style = MaterialTheme.typography.titleLarge)
+            }
+        } else if (!entry.isFolder) {
             IconButton(onClick = onToggleFavorite) {
                 Icon(
                     if (entry.favorite) Icons.Filled.Star else Icons.Outlined.Star,
@@ -629,7 +867,7 @@ private fun FileRow(
             }
         }
         IconButton(onClick = onDelete) {
-            Icon(Icons.Filled.Delete, contentDescription = "Удалить")
+            Icon(Icons.Filled.Delete, contentDescription = if (inTrash) "Удалить навсегда" else "Удалить")
         }
     }
 }
@@ -661,6 +899,19 @@ private fun NewFolderDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) 
 
 /** SAF отдаёт content://-URI, а не файловый путь — оригинальное имя файла
  * достаётся только через cursor-запрос колонки DISPLAY_NAME. */
+/// Пишет текущее состояние на диск сразу после мутирующего действия — по
+/// прямому запросу пользователя, см. AndroidContainer.commit(). Ошибка
+/// коммита не должна мешать пользователю: само действие уже прошло успешно
+/// в памяти и будет видно в этой же сессии, на диск попадёт при следующем
+/// успешном commit() или при выходе — тот же принцип, что и в
+/// desktop/app/main_window.py::_commit() и web/backend/src/actor.rs.
+private fun commitQuietly(container: AndroidContainer) {
+    try {
+        container.commit()
+    } catch (_: AndroidException) {
+    }
+}
+
 private fun queryDisplayName(uri: Uri, context: android.content.Context): String? {
     context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
         val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)

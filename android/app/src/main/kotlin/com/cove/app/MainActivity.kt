@@ -1,6 +1,8 @@
 package com.cove.app
 
 import android.os.Bundle
+import android.view.MotionEvent
+import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -30,11 +32,27 @@ import com.cove.app.storage.ThemeMode
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // FLAG_SECURE на всё окно: расшифрованный контент (превью файлов,
+        // пароль на экране входа) не должен попадать в скриншоты, список
+        // "последних приложений" и запись экрана — приложение одноэкранное
+        // (единственная Activity), поэтому флаг на окно покрывает все экраны.
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         val registry = ContainerRegistry(this)
         val appSettings = AppSettings(this)
         setContent {
             CoveApp(registry, appSettings)
         }
+    }
+
+    // Автоблокировка (LibraryScreen) считает простой от последнего касания
+    // где угодно на экране, а не только внутри конкретного Composable —
+    // диалоги/дровер/выпадающие меню тоже должны сбрасывать таймер.
+    // dispatchTouchEvent на Activity видит абсолютно любой тач раньше
+    // Compose-дерева, не нужно протаскивать Modifier.pointerInput через
+    // каждый слой UI вручную.
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        UserActivity.recordInteraction()
+        return super.dispatchTouchEvent(ev)
     }
 }
 
@@ -97,6 +115,7 @@ fun CoveApp(registry: ContainerRegistry, appSettings: AppSettings) {
                 is Screen.Library -> LibraryScreen(
                     container = current.container,
                     containerPath = current.path,
+                    appSettings = appSettings,
                     themeMode = themeMode,
                     onThemeModeChange = {
                         themeMode = it
@@ -106,6 +125,15 @@ fun CoveApp(registry: ContainerRegistry, appSettings: AppSettings) {
                     // commit на диск) перед тем как вызвать этот колбэк — см.
                     // комментарий там же про то, почему это важно.
                     onLogout = { screen = Screen.Welcome },
+                    // Удаление БД из настроек — в отличие от обычного выхода,
+                    // нужно ещё забыть путь как "основное" хранилище: иначе
+                    // при следующем холодном запуске CoveApp попытался бы
+                    // сразу открыть Screen.Login(path) для уже не
+                    // существующего файла.
+                    onDatabaseDeleted = {
+                        registry.clearDefaultContainerPath()
+                        screen = Screen.Welcome
+                    },
                 )
             }
         }
