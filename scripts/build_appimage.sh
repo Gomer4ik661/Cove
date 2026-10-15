@@ -17,10 +17,13 @@ PACKAGING_DIR="$DESKTOP_DIR/packaging"
 APPDIR="$PACKAGING_DIR/AppDir"
 APPIMAGETOOL="$PACKAGING_DIR/appimagetool-x86_64.AppImage"
 
-echo "== 1/4: cove_core_py.so =="
+echo "== 1/5: cove_core_py.so =="
 ./scripts/build_python_bindings.sh
 
-echo "== 2/4: PyInstaller onefile =="
+echo "== 2/5: cove-web-backend =="
+./scripts/build_web_backend.sh
+
+echo "== 3/5: PyInstaller onefile =="
 # requirements.txt, а не хардкод "PySide6 pyinstaller" — иначе новые
 # рантайм-зависимости (например, cryptography для механизма обновлений,
 # Фаза 18) молча не попадали бы в свежий .venv при пересборке с нуля;
@@ -33,7 +36,7 @@ fi
 rm -rf "$DESKTOP_DIR/build" "$DESKTOP_DIR/dist"
 (cd "$DESKTOP_DIR" && .venv/bin/pyinstaller --noconfirm cove.spec)
 
-echo "== 3/4: AppDir =="
+echo "== 4/5: AppDir =="
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin"
 cp "$DESKTOP_DIR/dist/Cove" "$APPDIR/usr/bin/Cove"
@@ -46,7 +49,7 @@ exec "$HERE/usr/bin/Cove" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 
-echo "== 4/4: appimagetool =="
+echo "== 5/5: appimagetool =="
 if [[ ! -x "$APPIMAGETOOL" ]]; then
     echo "appimagetool не найден, скачиваю официальный релиз..."
     curl -fL -o "$APPIMAGETOOL" \

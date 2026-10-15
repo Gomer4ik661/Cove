@@ -5,16 +5,6 @@ from PySide6.QtCore import QStandardPaths
 
 DEFAULT_SETTINGS = {
     "theme": "light",
-    "remember_recent": False,
-    "recent_containers": [],
-    # Путь к "основному" хранилищу — в отличие от recent_containers,
-    # запоминается ВСЕГДА, не по галочке remember_recent. Осознанная смена
-    # поведения по просьбе пользователя: вход должен сразу спрашивать
-    # логин/пароль, а не открывать диалог выбора файла каждый раз. Раньше
-    # путь к хранилищу был опциональным именно из соображений приватности
-    # (FORMAT.md: путь может выдавать факт существования тайника) — здесь
-    # этот компромисс сознательно принят ради удобства.
-    "default_container": None,
     # 0 — отключена. Таймер бездействия в MainWindow (ROADMAP.md Фаза 12).
     "auto_lock_minutes": 15,
     # Порог неудачных попыток входа — считается в памяти самого диалога
@@ -29,13 +19,24 @@ DEFAULT_SETTINGS = {
     # нажатию "Запустить" во вкладке "Веб" настроек, каждый раз заново.
     "web_port": 8443,
 }
-MAX_RECENT = 5
 
 
 def _settings_path() -> Path:
     config_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation))
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir / "settings.json"
+
+
+def default_container_path() -> Path:
+    """Единственный путь к хранилищу — пользователь никогда его не
+    выбирает, по образцу Android (storage/ContainerRegistry.kt:
+    filesDir/containers/, без диалога выбора файла). Раньше путь был
+    произвольным (поле "Файл хранилища (.slr)" + "Обзор…" в бывшем
+    CreateContainerDialog) — по прямой просьбе пользователя это убрано
+    в пользу входа сразу в форму логина (см. welcome_window.py)."""
+    data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "cove.slr"
 
 
 def load_settings() -> dict:
@@ -53,27 +54,3 @@ def save_settings(settings: dict) -> None:
     _settings_path().write_text(
         json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
-
-def remember_recent_container(settings: dict, path: str) -> None:
-    if not settings.get("remember_recent"):
-        return
-    recent = [p for p in settings.get("recent_containers", []) if p != path]
-    recent.insert(0, path)
-    settings["recent_containers"] = recent[:MAX_RECENT]
-    save_settings(settings)
-
-
-def clear_recent_containers(settings: dict) -> None:
-    settings["recent_containers"] = []
-    save_settings(settings)
-
-
-def set_default_container(settings: dict, path: str) -> None:
-    settings["default_container"] = path
-    save_settings(settings)
-
-
-def clear_default_container(settings: dict) -> None:
-    settings["default_container"] = None
-    save_settings(settings)

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -17,10 +18,18 @@ from PySide6.QtWidgets import (
 )
 
 from . import autostart
-from . import config as config_module
 from . import update_check
 
 DEFAULT_WEB_PORT = 8443
+
+# По прямой просьбе пользователя — удаление хранилища требует набрать это
+# слово вручную (не просто "Да"/"Нет"), чтобы случайный клик не мог снести
+# все данные без осознанного шага.
+DELETE_CONFIRM_PHRASE = "УДАЛИТЬ"
+# Код результата диалога, которым мы отличаем "подтверждено удаление" от
+# обычных Accepted/Rejected — вызывающая сторона (MainWindow) не должна
+# применять обычные настройки в этом случае.
+DELETE_RESULT_CODE = 2
 
 AUTO_LOCK_OPTIONS = [
     ("Никогда", 0),
@@ -71,12 +80,14 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(380)
 
         self._update_thread: _UpdateCheckWorker | None = None
+        self._delete_confirmed = False
 
         tabs = QTabWidget()
         tabs.addTab(self._build_general_tab(settings), "Общие")
         tabs.addTab(self._build_security_tab(settings), "Безопасность")
         tabs.addTab(self._build_web_tab(settings), "Веб")
         tabs.addTab(self._build_updates_tab(), "Обновления")
+        tabs.addTab(self._build_danger_tab(), "Хранилище")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -110,12 +121,6 @@ class SettingsDialog(QDialog):
         )
         self._thumbnail_combo.setCurrentIndex(idx)
 
-        self._remember_checkbox = QCheckBox("Запоминать недавние хранилища")
-        self._remember_checkbox.setChecked(bool(settings.get("remember_recent")))
-
-        clear_btn = QPushButton("Очистить список недавних")
-        clear_btn.clicked.connect(self._clear_recent)
-
         self._autostart_checkbox = QCheckBox("Запускать Cove при входе в систему")
         self._autostart_checkbox.setChecked(autostart.is_enabled())
         if not autostart.is_supported():
@@ -135,8 +140,6 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow("", note)
         form.addRow("Размер миниатюр:", self._thumbnail_combo)
-        form.addRow("", self._remember_checkbox)
-        form.addRow("", clear_btn)
         form.addRow("", self._autostart_checkbox)
 
         widget = QWidget()
@@ -291,6 +294,71 @@ class SettingsDialog(QDialog):
         if self._pending_release_url:
             webbrowser.open(self._pending_release_url)
 
+    def _build_danger_tab(self) -> QWidget:
+        warning = QLabel(
+            "Безвозвратно удаляет файл хранилища со всеми файлами, "
+            "пользователями и журналом входов. Резервных копий приложение "
+            "не хранит — отменить это действие невозможно."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #b00020;")
+
+        delete_btn = QPushButton("Удалить базу данных…")
+        delete_btn.setStyleSheet("color: #b00020; font-weight: bold;")
+        delete_btn.clicked.connect(self._confirm_delete_database)
+        if self._container_path is None:
+            delete_btn.setEnabled(False)
+
+        form = QFormLayout()
+        form.addRow(warning)
+        form.addRow("", delete_btn)
+
+        widget = QWidget()
+        widget.setLayout(form)
+        return widget
+
+    def _confirm_delete_database(self) -> None:
+        # Само удаление файла и возврат на экран приветствия — ответственность
+        # MainWindow (у него, а не у этого диалога, есть открытый Container и
+        # web-сервер, которые сначала нужно честно закрыть/остановить — см.
+        # delete_confirmed()/DELETE_RESULT_CODE и main_window._delete_database()).
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Удалить базу данных")
+        layout = QVBoxLayout(dialog)
+
+        text = QLabel(
+            "Хранилище и все данные в нём "
+            f"({self._container_path}) будут удалены навсегда.\n\n"
+            f'Чтобы подтвердить, введите слово "{DELETE_CONFIRM_PHRASE}":'
+        )
+        text.setWordWrap(True)
+        layout.addWidget(text)
+
+        confirm_edit = QLineEdit()
+        layout.addWidget(confirm_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Удалить навсегда")
+        ok_button.setEnabled(False)
+        confirm_edit.textChanged.connect(
+            lambda t: ok_button.setEnabled(t.strip() == DELETE_CONFIRM_PHRASE)
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._delete_confirmed = True
+        self.done(DELETE_RESULT_CODE)
+
+    def delete_confirmed(self) -> bool:
+        return self._delete_confirmed
+
     def closeEvent(self, event) -> None:
         # QThread не должен быть уничтожен, пока ещё выполняется — иначе
         # Qt честно ругается в консоль ("QThread: Destroyed while thread
@@ -310,9 +378,6 @@ class SettingsDialog(QDialog):
         except OSError:
             return "<ip-этого-устройства>"
 
-    def _clear_recent(self) -> None:
-        config_module.clear_recent_containers(self._settings)
-
     def theme(self) -> str:
         return self._theme_combo.currentData()
 
@@ -321,9 +386,6 @@ class SettingsDialog(QDialog):
 
     def thumbnail_size(self) -> int:
         return self._thumbnail_combo.currentData()
-
-    def remember_recent(self) -> bool:
-        return self._remember_checkbox.isChecked()
 
     def autostart_enabled(self) -> bool:
         return self._autostart_checkbox.isChecked()

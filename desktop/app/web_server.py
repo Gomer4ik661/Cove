@@ -12,11 +12,22 @@ Core — осознанно вынесена за рамки Фазы 13 (см. 
 """
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
+_BIN_NAME = "cove-web-backend.exe" if sys.platform == "win32" else "cove-web-backend"
+
 
 def find_binary() -> Optional[Path]:
+    # Собранный PyInstaller-ем frozen-бинарник: cove-web-backend лежит
+    # рядом (см. desktop/cove.spec, binaries=[...]), распаковывается
+    # onefile-рантаймом во временную sys._MEIPASS — target/ там просто не
+    # существует, это отдельная от dev-дерева директория.
+    if getattr(sys, "frozen", False):
+        candidate = Path(getattr(sys, "_MEIPASS", "")) / _BIN_NAME
+        return candidate if candidate.exists() else None
+
     here = Path(__file__).resolve()
     repo_root = here.parents[2]  # desktop/app/web_server.py -> desktop -> repo root
     for profile in ("release", "debug"):

@@ -18,10 +18,26 @@ if not native_lib.exists():
         f'сюда под именем cove_core_py.{ext}'
     )
 
+# cove-web-backend — отдельный бинарник (не Python-расширение), запускается
+# как дочерний процесс через app/web_server.py (вкладка "Веб" настроек).
+# Без этого блока PyInstaller его не подхватывает вообще — раньше это
+# приводило к "Бинарник cove-web-backend не найден" в собранном
+# приложении, хотя дев-сборка (cargo run) работала нормально: find_binary()
+# в web_server.py искал только target/release относительно исходников,
+# чего во frozen-сборке просто не существует (см. правку там же).
+web_backend_name = 'cove-web-backend.exe' if sys.platform == 'win32' else 'cove-web-backend'
+web_backend_bin = here / web_backend_name
+if not web_backend_bin.exists():
+    raise SystemExit(
+        f'{web_backend_bin} не найден — соберите: '
+        f'cargo build --release -p cove-web-backend, затем скопируйте результат '
+        f'сюда под именем {web_backend_name} (см. scripts/build_web_backend.sh)'
+    )
+
 a = Analysis(
     ['main.py'],
     pathex=[str(here)],
-    binaries=[(str(native_lib), '.')],
+    binaries=[(str(native_lib), '.'), (str(web_backend_bin), '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],

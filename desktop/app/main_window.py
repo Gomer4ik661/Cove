@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -59,7 +60,6 @@ SECTIONS = [
     ("Избранное", "favorite", None),
     ("Недавние", "recent", None),
     ("Корзина", "trash", None),
-    ("Мои файлы", "root", None),
 ]
 
 MAX_DISPLAY_NAME_LEN = 22
@@ -153,9 +153,9 @@ class _TabState:
 
 
 class MainWindow(QMainWindow):
-    """Главное окно — Фаза 5/6 (ROADMAP.md). Разделы «Библиотека»/«Мои файлы»
-    и «Корзина» реальны (дёргают Core), остальные — честный empty state до
-    Фазы 10 (виртуальные разделы по типу файла)."""
+    """Главное окно (ROADMAP.md). Все разделы SECTIONS реальны — «Библиотека»
+    и «Корзина» через прямую навигацию по папкам/Core, остальные — виртуальные
+    срезы поверх search() (Фаза 9/10)."""
 
     def __init__(
         self,
@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         self._refresh_button.setToolTip("Обновить")
         self._refresh_button.setFixedWidth(32)
         self._refresh_button.setStyleSheet("padding: 2px;")
-        self._refresh_button.clicked.connect(self._refresh_content)
+        self._refresh_button.clicked.connect(self._manual_refresh)
 
         self._breadcrumb_bar = BreadcrumbBar(on_segment_clicked=self._on_breadcrumb_clicked)
 
@@ -302,6 +302,16 @@ class MainWindow(QMainWindow):
         self._auto_lock_timer.timeout.connect(self._on_auto_lock_timeout)
         self._apply_auto_lock_setting()
         QApplication.instance().installEventFilter(self)
+
+        # Живая синхронизация с другими сессиями (Web/другое устройство на
+        # том же контейнере) — по прямому запросу пользователя: "загрузил
+        # файл в вебе, хочу увидеть сразу в открытом десктопе", без
+        # логаута/повторного входа. container.reload() перечитывает File
+        # Table с диска, только если там реально новая версия (дёшево при
+        # отсутствии изменений — один короткий read commit pointer'а).
+        self._live_sync_timer = QTimer(self)
+        self._live_sync_timer.timeout.connect(self._reload_and_refresh)
+        self._live_sync_timer.start(3000)
 
     # ---- меню и статус-бар -------------------------------------------------
 
@@ -496,22 +506,30 @@ class MainWindow(QMainWindow):
         self._content_list.setGridSize(QSize(size + 24, size + 48))
 
     def _icon_for_entry(self, entry) -> QIcon:
-        """Для картинок — реальная миниатюра (из кэша в контейнере или
-        сгенерированная на месте, ROADMAP.md Фаза 8), иначе — системная
-        иконка. Генерация синхронная и по одному элементу за раз — честно
-        задокументированное упрощение вместо фонового пула потоков (см.
-        ROADMAP.md): так надёжнее, учитывая что PyO3-объект `Container`
-        не рассчитан на параллельные вызовы из нескольких потоков сразу."""
+        """Для картинок и видео — реальная миниатюра (из кэша в контейнере
+        или сгенерированная на месте, ROADMAP.md Фаза 8, видео добавлено по
+        прямому запросу пользователя — раньше висела общая "текстовая"
+        иконка), иначе — системная иконка. Генерация синхронная и по одному
+        элементу за раз — честно задокументированное упрощение вместо
+        фонового пула потоков (см. ROADMAP.md): так надёжнее, учитывая что
+        PyO3-объект `Container` не рассчитан на параллельные вызовы из
+        нескольких потоков сразу."""
         if entry.is_folder:
-            return self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            return self._sized_standard_icon(QStyle.StandardPixmap.SP_DirIcon)
 
-        if file_kind.kind_of(entry.name) == "image":
+        kind = file_kind.kind_of(entry.name)
+        if kind in ("image", "video"):
             thumb_id = self._container.find_thumbnail(entry.file_id)
             if thumb_id is None:
                 try:
-                    read_len = min(entry.size, 20 * 1024 * 1024)  # не тащим в память гигантские файлы
-                    source_bytes = bytes(self._container.read_at(entry.file_id, 0, read_len))
-                    png_bytes = thumbnails.generate_thumbnail_bytes(source_bytes)
+                    if kind == "image":
+                        read_len = min(entry.size, 20 * 1024 * 1024)  # не тащим в память гигантские файлы
+                        source_bytes = bytes(self._container.read_at(entry.file_id, 0, read_len))
+                        png_bytes = thumbnails.generate_thumbnail_bytes(source_bytes)
+                    else:
+                        png_bytes = thumbnails.generate_video_thumbnail_bytes(
+                            self._container, entry.file_id, entry.name
+                        )
                 except Exception:  # noqa: BLE001 — превью best-effort, не должно ронять список
                     png_bytes = None
                 if png_bytes is not None:
@@ -525,11 +543,88 @@ class MainWindow(QMainWindow):
                     thumb_bytes = bytes(self._container.read_at(thumb_id, 0, thumb_size))
                     pixmap = thumbnails.pixmap_from_bytes(thumb_bytes)
                     if not pixmap.isNull():
-                        return QIcon(pixmap)
+                        return self._centered_icon(pixmap)
                 except Exception:  # noqa: BLE001
                     pass
 
-        return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        return self._sized_standard_icon(QStyle.StandardPixmap.SP_FileIcon)
+
+    def _centered_icon(self, pixmap: QPixmap) -> QIcon:
+        # По прямому запросу пользователя: превью фото/видео со сторонами
+        # не 1:1 (после KeepAspectRatio, например 160×90 у широкоэкранного
+        # видео) уезжали к верхнему краю ячейки сетки вместо центра — та же
+        # причина, что уже чинили для системных иконок в _sized_standard_icon()
+        # ниже: не сам исходный QIcon(pixmap) размером меньше iconSize
+        # что-то делает не так, а раскладка QListWidget не центрирует его
+        # сама, а привязывает к верхнему краю иконочного прямоугольника.
+        # Решение то же самое — рисуем на пустом холсте ровно iconSize,
+        # по центру, и оборачиваем готовый холст в QIcon.
+        size = self._content_list.iconSize()
+        if pixmap.size() == size:
+            return QIcon(pixmap)
+        canvas = QPixmap(size)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.drawPixmap(
+            (size.width() - pixmap.width()) // 2,
+            (size.height() - pixmap.height()) // 2,
+            pixmap,
+        )
+        painter.end()
+        return QIcon(canvas)
+
+    def _sized_standard_icon(self, pixmap_enum) -> QIcon:
+        # По прямому запросу пользователя: значок папки (SP_DirIcon) в
+        # системной теме иконок был заметно крупнее ячейки сетки, из-за
+        # чего подпись с именем папки обрезалась/уезжала за пределы ячейки
+        # (нашлось вживую на скриншоте пользователя). Причина — не в
+        # setIconSize() как таковом: QIcon.pixmap(size) у иконок из тем НЕ
+        # увеличивает картинку сверх "родного" разрешения темы (проверено
+        # вживую: тема даёт максимум 128×128, `pixmap(QSize(160,160))`
+        # честно возвращает те же 128×128, не 160×160) — но и не гарантирует
+        # ЕДИНЫЙ отчётный размер, которым пользуется раскладка QListWidget
+        # для всех элементов сетки одинаково, в отличие от простого
+        # QIcon(QPixmap), где размер предсказуем. Рисуем сами на холсте
+        # ровно нужного размера — тот же путь, что уже надёжно работает для
+        # превью фото/видео (обычный QPixmap, не движок иконок темы).
+        size = self._content_list.iconSize()
+        raw = self.style().standardIcon(pixmap_enum).pixmap(size)
+        canvas = QPixmap(size)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.drawPixmap(
+            (size.width() - raw.width()) // 2,
+            (size.height() - raw.height()) // 2,
+            raw,
+        )
+        painter.end()
+        return QIcon(canvas)
+
+    def _reload_and_refresh(self) -> None:
+        # container.reload() — дешёвый no-op, если на диске всё та же версия
+        # (см. Core), поэтому безопасно дёргать и по таймеру каждые 3с, и по
+        # клику "Обновить". Ошибку (Conflict — у ЭТОЙ сессии есть свои
+        # несохранённые правки) намеренно проглатываем: подмешивать чужое
+        # состояние поверх ещё не увиденных пользователем изменений было бы
+        # так же нечестно, как и при commit() — тихо ничего не делаем,
+        # обновление подхватится следующим тиком, когда правки уже уйдут на
+        # диск через обычный _commit().
+        try:
+            changed = self._container.reload()
+        except Exception:  # noqa: BLE001
+            changed = False
+        if changed:
+            self._refresh_content()
+
+    def _manual_refresh(self) -> None:
+        # Кнопка "Обновить" — в отличие от тихого таймера, всегда
+        # перерисовывает список (даже если reload() ничего не нашёл),
+        # чтобы клик ощутимо на что-то реагировал, как и раньше.
+        try:
+            self._container.reload()
+        except Exception:  # noqa: BLE001 — см. _reload_and_refresh
+            pass
+        self._refresh_content()
 
     def _refresh_content(self) -> None:
         # Кнопки навигации (Назад/Вперёд/Вверх) обновляются в _update_nav_buttons(),
@@ -585,12 +680,23 @@ class MainWindow(QMainWindow):
         self._new_folder_action.setEnabled(self._section_kind in ("root", "category"))
 
         self._content_list.clear()
+        grid_size = self._content_list.gridSize()
         for entry in entries:
             item = QListWidgetItem(_display_name(entry.name), self._content_list)
             item.setData(Qt.ItemDataRole.UserRole, entry)
             item.setIcon(self._icon_for_entry(entry))
             item.setToolTip(entry.name)
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            # По прямому запросу пользователя: без явного sizeHint делегат
+            # сам считает высоту элемента и для квадратных иконок (папки,
+            # системная SP_FileIcon — full iconSize) она выходила меньше
+            # реальной высоты иконки, из-за чего подпись с именем
+            # обрезалась/пропадала полностью — воспроизвелось и починилось
+            # только через явный setSizeHint, setGridSize() тут не влиял
+            # вообще (нашлось вживую, перепробовано отдельно). У видео/фото
+            # превью (не квадратные после KeepAspectRatio) проблема была
+            # не видна ровно потому, что их реальная высота меньше iconSize.
+            item.setSizeHint(grid_size)
 
         if entries:
             self._content_stack.setCurrentWidget(self._content_list)
@@ -615,6 +721,8 @@ class MainWindow(QMainWindow):
     def _handle_dropped_files(self, paths: list[str]) -> None:
         for path in paths:
             self._import_path(path)
+        if paths:
+            self._commit()
 
     # ---- операции с файлами ---------------------------------------------------
 
@@ -626,6 +734,24 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_content()
 
+    def _commit(self) -> None:
+        # По прямому запросу пользователя: раньше импорт/новая папка и т.д.
+        # были видны другой одновременно открытой сессии (например, веб-
+        # версии, пока десктоп ещё не закрыт) только после полного close().
+        # Коммитим сразу после каждого пользовательского действия — но один
+        # раз на весь batch импорта нескольких файлов (см. вызовы ниже), а
+        # не на каждый файл: полное перекодирование File Table на каждый
+        # файл в импорте из тысяч файлов было бы квадратичным по времени,
+        # тот же класс проблемы, что фаззинг нашёл в Фазе 17. Ошибку самого
+        # commit() (например, диск неожиданно недоступен) не показываем
+        # отдельным диалогом — сама операция уже прошла успешно в памяти и
+        # будет видна пользователю в этой же сессии; на диск она всё равно
+        # попадёт при следующем успешном commit() или при выходе.
+        try:
+            self._container.commit()
+        except Exception:  # noqa: BLE001 — не критично для текущей сессии, см. выше
+            pass
+
     def _import_files_dialog(self) -> None:
         # DontUseNativeDialog — на некоторых системах нативный диалог идёт
         # через xdg-desktop-portal и иногда открывается за окном/вообще не
@@ -636,6 +762,8 @@ class MainWindow(QMainWindow):
         )
         for path in paths:
             self._import_path(path)
+        if paths:
+            self._commit()
 
     def _new_folder_dialog(self) -> None:
         name, ok = QInputDialog.getText(self, "Новая папка", "Название папки:")
@@ -652,6 +780,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось создать папку: {exc}")
         else:
+            self._commit()
             self._refresh_content()
 
     def _selected_entry(self):
@@ -699,6 +828,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось переименовать: {exc}")
         else:
+            self._commit()
             self._refresh_content()
 
     def _delete_entry(self, entry, *, permanent: bool) -> None:
@@ -717,6 +847,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось удалить: {exc}")
         else:
+            self._commit()
             self._refresh_content()
 
     def _toggle_favorite(self, entry) -> None:
@@ -725,6 +856,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось изменить избранное: {exc}")
         else:
+            self._commit()
             self._refresh_content()
 
     def _restore_entry(self, entry) -> None:
@@ -733,6 +865,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001 — граница UI
             QMessageBox.critical(self, "Cove", f"Не удалось восстановить: {exc}")
         else:
+            self._commit()
             self._refresh_content()
 
     def _export_entry(self, entry) -> None:
@@ -769,6 +902,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 — граница UI
                 QMessageBox.critical(self, "Cove", f"Не удалось сохранить изменения: {exc}")
             else:
+                self._commit()
                 self._refresh_content()
 
     # ---- пользователи/настройки/сессия ----------------------------------------
@@ -815,10 +949,13 @@ class MainWindow(QMainWindow):
             web_server=self._web_server,
             container_path=self._container_path,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        result = dialog.exec()
+        if dialog.delete_confirmed():
+            self._delete_database()
+            return
+        if result != QDialog.DialogCode.Accepted:
             return
         self._settings["theme"] = dialog.theme()
-        self._settings["remember_recent"] = dialog.remember_recent()
         self._settings["thumbnail_size"] = dialog.thumbnail_size()
         self._settings["auto_lock_minutes"] = dialog.auto_lock_minutes()
         self._settings["login_attempt_limit"] = dialog.login_attempt_limit()
@@ -848,6 +985,25 @@ class MainWindow(QMainWindow):
         self._teardown_auto_lock()
         self._web_server.stop()
         self._close_container_quietly()
+        self.close()
+        self._on_logout()
+
+    def _delete_database(self) -> None:
+        # Подтверждение (набрать слово "УДАЛИТЬ") уже произошло внутри
+        # SettingsDialog — здесь только сама необратимая часть. Порядок
+        # важен: сначала честно останавливаем веб-сервер и закрываем
+        # Container (тот же путь, что и обычный logout — не пишем лишний
+        # commit поверх уже решённого пользователем удаления, но и не
+        # оставляем файл открытым чужим процессом при попытке unlink()),
+        # потом удаляем сам файл с диска.
+        self._teardown_auto_lock()
+        self._web_server.stop()
+        self._close_container_quietly()
+        try:
+            Path(self._container_path).unlink(missing_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Cove", f"Не удалось удалить файл хранилища: {exc}")
+            return
         self.close()
         self._on_logout()
 
@@ -887,3 +1043,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.removeEventFilter(self)
         self._auto_lock_timer.stop()
+        # Останавливаем и таймер живой синхронизации здесь же — оба вызывающих
+        # места (_logout()/closeEvent()) уже зовут этот метод перед закрытием
+        # контейнера, отдельный метод под одну строку был бы избыточен.
+        self._live_sync_timer.stop()

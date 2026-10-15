@@ -9,6 +9,12 @@ dist/
 *.dll
 .DS_Store
 
+# Собранный бинарник cove-web-backend, копируемый в desktop/ для упаковки
+# PyInstaller (см. scripts/build_web_backend.sh, desktop/cove.spec) — как
+# cove_core_py.so/.pyd выше, воспроизводимый build-артефакт, не для коммита.
+/desktop/cove-web-backend
+/desktop/cove-web-backend.exe
+
 # Android (Gradle/AGP build output, локальный путь к SDK, кэш Kotlin-компилятора)
 /android/app/build/
 /android/build/
