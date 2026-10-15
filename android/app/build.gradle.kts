@@ -78,6 +78,31 @@ android {
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
+            // Статика веб-морды (index.html/app.js/style.css) пакуется прямо
+            // из web/frontend — единственный источник истины, без
+            // дублирования файлов под Android (иначе они бы расходились с
+            // тем, что реально отдаёт cove-web-backend на Desktop).
+            // WebServerService извлекает их из assets в filesDir перед
+            // запуском процесса — --frontend-dir читает с диска, не из APK.
+            assets.srcDirs("../../web/frontend")
+        }
+    }
+
+    // По умолчанию (minSdk >= 23) AGP хранит нативные библиотеки СЖАТЫМИ
+    // ВНУТРИ APK и грузит их через mmap прямо оттуда, не извлекая на диск
+    // (extractNativeLibs=false) — подтверждено вживую на эмуляторе:
+    // ApplicationInfo.legacyNativeLibraryDir/<abi>/ существовала, но была
+    // пустой. Это ломает "веб-морду" (ROADMAP.md) — cove-web-backend
+    // упакован под видом libcove_web_backend.so именно для того, чтобы
+    // унаследовать exec-права каталога нативных библиотек, а
+    // ProcessBuilder/Runtime.exec() нужен настоящий файл на диске, а не
+    // байты внутри zip. useLegacyPackaging форсирует извлечение на
+    // установку — libcove_core_uniffi.so это тоже не портит: JNA грузит
+    // его через System.load(path), которому тоже нужен реальный путь на
+    // диске, так что распаковка ему только на пользу.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 }

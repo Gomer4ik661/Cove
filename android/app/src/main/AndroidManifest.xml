@@ -9,6 +9,24 @@
          отдельная функциональность на другой платформе). -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Веб-доступ (ROADMAP.md, "веб-морда в Android", по образцу Desktop
+         Фазы 13) — запускает cove-web-backend как дочерний процесс из
+         WebServerService, foreground-сервис обязателен, иначе система
+         убивает процесс сразу после сворачивания приложения. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Ни один из типовых FGS-типов (dataSync и т.п.) не подходит по
+         смыслу и к тому же с API 34+ ограничен таймаутом (6ч для dataSync) —
+         неприемлемо для сервера, который пользователь мог бы держать
+         включённым весь день. specialUse — официально предназначенный
+         Google тип именно для случаев вне стандартных категорий, без
+         таймаута, за explicit-описание в <property> ниже. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Уведомление foreground-сервиса обязательно с API 33+ — без этого
+         разрешения система тихо не показывает его (сервис всё равно
+         работает, но пользователь не видит, что он включён, и его будет
+         тяжелее не глядя убить с более высоким шансом на успех). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="Cove"
         android:icon="@mipmap/ic_launcher"
@@ -38,5 +56,14 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <service
+            android:name=".webserver.WebServerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Локальный HTTPS-сервер для доступа к зашифрованному хранилищу с других устройств в той же сети, пока пользователь явно не остановит его в настройках" />
+        </service>
     </application>
 </manifest>
