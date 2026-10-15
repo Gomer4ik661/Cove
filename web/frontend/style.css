@@ -24,6 +24,21 @@
 
 * { box-sizing: border-box; }
 
+/* Общее правило, а не точечное на #modal-overlay: почти каждый
+   верхнеуровневый блок ниже (#login-screen, #app-screen, #toolbar,
+   #modal-overlay...) задаёт свой display на ID-селекторе — авторский CSS
+   всегда перебивает встроенное браузерное [hidden] { display: none }
+   независимо от специфичности (origin-приоритет CSS, не только
+   specificity). Из-за этого JS честно выставлял .hidden = true/false, но
+   элемент оставался видимым: например, логин реально проходил (POST
+   /api/login и GET /api/library оба 200 в Network), а форма входа
+   визуально никуда не девалась. !important здесь осознанно и safe —
+   "hidden значит hidden" должно быть инвариантом для любого элемента на
+   странице, а не чем-то, что можно случайно перебить будущим правилом. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -145,7 +160,21 @@ button.secondary { background: transparent; color: var(--text); border: 1px soli
   min-width: 0;
 }
 
-.file-card .icon { font-size: 1.8rem; }
+.file-card .icon {
+  font-size: 1.8rem;
+  height: 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--bg);
+}
+.file-card .icon .thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 .file-card .name {
   font-size: 0.85rem;
   overflow: hidden;

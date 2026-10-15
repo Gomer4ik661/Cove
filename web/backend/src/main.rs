@@ -22,10 +22,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
+use axum::http::{header, HeaderValue};
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use clap::Parser;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use state::AppState;
@@ -59,6 +62,30 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Axum по умолчанию режет тело запроса на 2 МиБ (DefaultBodyLimit) — этого
+/// достаточно для JSON-ручек, но `/api/upload` рассчитан на реальные
+/// пользовательские файлы, включая видео, которые почти всегда больше.
+/// Найдено вживую: загрузка файла >2 МиБ падала с "failed to read file
+/// field" — тело обрывалось на лимите, а не файл был как-то повреждён.
+/// 4 ГиБ — практический потолок, не архитектурный: `import_file_from_bytes`
+/// держит файл целиком в памяти (multipart-байты → `Vec<u8>` → канал в
+/// session-актор), в отличие от потокового `import_file` у Desktop/Android
+/// (ROADMAP.md Фаза 7/14) — так что стриминг из браузера сюда пока не
+/// заведён, а не забыт по невнимательности.
+///
+/// На 32-битных таргетах (найдено при кросс-компиляции под armv7/i686
+/// Android — ROADMAP.md, "веб-морда в Android") `4 * 1024³` ровно на 1 байт
+/// превышает `usize::MAX` (2^32 − 1) и не компилируется — но даже если бы
+/// компилировалось, держать в памяти 4 ГиБ на 32-битном адресном
+/// пространстве (а тем более в куче Android-процесса, обычно ограниченной
+/// сотнями МиБ без `largeHeap`) нереалистично в принципе. Предел ниже там
+/// честно отражает эту реальность, а не просто обходит переполнение.
+const MAX_UPLOAD_BYTES: usize = if usize::BITS >= 64 {
+    4 * 1024 * 1024 * 1024
+} else {
+    1024 * 1024 * 1024
+};
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -87,7 +114,10 @@ async fn main() {
         .route("/api/trash", get(routes::list_trash))
         .route("/api/search", get(routes::search))
         .route("/api/folders", post(routes::create_folder))
-        .route("/api/upload", post(routes::upload))
+        .route(
+            "/api/upload",
+            post(routes::upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .route("/api/files/{id}/download", get(routes::download))
         .route("/api/files/{id}", delete(routes::delete))
         .route("/api/files/{id}/restore", post(routes::restore))
@@ -106,6 +136,17 @@ async fn main() {
         );
         api
     };
+
+    // no-cache (не no-store) — браузер вправе держать копию, но обязан
+    // ревалидировать через If-Modified-Since на каждый запрос, не показывать
+    // старую версию молча. Без этого правки app.js/style.css/index.html не
+    // подхватывались обычным F5 — нашлось вживую несколько раз при живой
+    // проверке этой же фазы (залипшая модалка, "логин не работает" — оба
+    // раза деле было в закэшированной старой статике, не в самом коде).
+    let app = app.layer(SetResponseHeaderLayer::overriding(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    ));
 
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
 

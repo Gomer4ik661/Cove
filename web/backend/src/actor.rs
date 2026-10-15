@@ -125,8 +125,42 @@ pub fn spawn(container: Container) -> std::sync::mpsc::Sender<Command> {
     tx
 }
 
+/// По прямому запросу пользователя: раньше изменения были видны другой
+/// одновременно открытой сессии (Desktop + Web на одном контейнере) только
+/// после close() этой сессии целиком — коммитим сразу после каждой успешной
+/// мутирующей команды, единая точка для всех HTTP-хендлеров разом (не нужно
+/// трогать routes.rs).
+///
+/// Если commit() вернул `Conflict` (другая сессия того же контейнера уже
+/// закоммитила новее — CoveError::Conflict), подменяем успешный в памяти
+/// результат на эту ошибку: операция физически не попала на диск, отвечать
+/// клиенту "200 OK" было бы прямой ложью — тем самым классом бага, из-за
+/// которого пользователь и потерял папку (см. ROADMAP.md). Любую другую
+/// ошибку commit() (например, диск неожиданно недоступен) по-прежнему
+/// проглатываем — сама операция уже прошла успешно в памяти сессии, а
+/// диагностировать транзиентный I/O-сбой отдельно от бизнес-логики не тема
+/// этого фикса.
+fn commit_or_conflict<T>(container: &mut Container, res: Result<T, CoveError>) -> Result<T, CoveError> {
+    if res.is_ok() {
+        if let Err(CoveError::Conflict) = container.commit() {
+            return Err(CoveError::Conflict);
+        }
+    }
+    res
+}
+
 fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
     while let Ok(cmd) = rx.recv() {
+        // По прямому запросу пользователя: "загрузил файл в вебе — хочу
+        // увидеть сразу в открытом десктопе", и симметрично в обратную
+        // сторону. Web не держит долгоживущий открытый экран как Desktop —
+        // у него просто каждый HTTP-запрос (открыл вкладку, обновил
+        // страницу) новый, так что reload() перед каждой командой даёт
+        // "почти живую" синхронизацию бесплатно, без отдельного таймера.
+        // Ошибку (Conflict — у этой сессии есть свои несохранённые правки)
+        // намеренно игнорируем: не срывать текущий запрос из-за фоновой
+        // синхронизации, просто работаем с тем состоянием, что уже есть.
+        let _ = container.reload();
         match cmd {
             Command::ListDir { folder_id, reply } => {
                 let res = container
@@ -152,6 +186,7 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
                 reply,
             } => {
                 let res = container.create_folder(&name, parent_id, category.as_deref());
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::Import {
@@ -161,6 +196,7 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
                 reply,
             } => {
                 let res = container.import_file_from_bytes(&name, parent_id, &data);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::FileMeta { file_id, reply } => {
@@ -183,10 +219,12 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
             }
             Command::Delete { file_id, reply } => {
                 let res = container.delete_file(file_id);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::Restore { file_id, reply } => {
                 let res = container.restore_file(file_id);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::Rename {
@@ -195,6 +233,7 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
                 reply,
             } => {
                 let res = container.rename_file(file_id, &new_name);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::Move {
@@ -203,6 +242,7 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
                 reply,
             } => {
                 let res = container.move_file(file_id, new_parent);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::SetFavorite {
@@ -211,6 +251,7 @@ fn run(mut container: Container, rx: std::sync::mpsc::Receiver<Command>) {
                 reply,
             } => {
                 let res = container.set_favorite(file_id, favorite);
+                let res = commit_or_conflict(&mut container, res);
                 let _ = reply.send(res);
             }
             Command::Shutdown { reply } => {

@@ -42,6 +42,7 @@ impl IntoResponse for ApiError {
                     ErrorCategory::PermissionDenied => StatusCode::FORBIDDEN,
                     ErrorCategory::NotFound => StatusCode::NOT_FOUND,
                     ErrorCategory::AlreadyExists => StatusCode::CONFLICT,
+                    ErrorCategory::Conflict => StatusCode::CONFLICT,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (status, e.category().to_string())

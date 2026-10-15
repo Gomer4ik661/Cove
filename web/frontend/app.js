@@ -7,12 +7,29 @@ const state = {
   csrfToken: null,
   username: null,
   role: null,
-  view: "library", // library | favorites | trash | search
+  view: "library", // library | category | favorites | trash | search
+  category: null, // "image" | "video" | "document" — только при view === "category"
   folderStack: [{ id: 0, name: "Библиотека" }],
   searchQuery: "",
 };
 
 const $ = (sel) => document.querySelector(sel);
+
+// Та же классификация по расширению, что и в core/src/container/mod.rs
+// (categorize()) и desktop/app/file_kind.py — держим в синхроне вручную,
+// три реализации на трёх языках, единого источника правды нет.
+function categoryOf(name) {
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "avif", "heif", "heic", "bmp", "tif", "tiff"].includes(ext)) {
+    return "image";
+  }
+  if (["mp4", "mkv", "avi", "mov", "webm"].includes(ext)) return "video";
+  if (["mp3", "flac", "aac", "ogg"].includes(ext)) return "audio";
+  if (["pdf", "txt", "md"].includes(ext)) return "document";
+  return "other";
+}
+
+const CATEGORY_LABELS = { image: "Фото", video: "Видео", document: "Документы" };
 
 async function api(path, options = {}) {
   const opts = { credentials: "same-origin", ...options };
@@ -105,6 +122,7 @@ function showApp() {
   $("#whoami").textContent = `${state.username} (${state.role})`;
   state.folderStack = [{ id: 0, name: "Библиотека" }];
   state.view = "library";
+  state.category = null;
   refresh();
 }
 
@@ -115,7 +133,9 @@ document.querySelectorAll(".nav-item").forEach((btn) => {
     document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     state.view = btn.dataset.view;
-    state.folderStack = [{ id: 0, name: "Библиотека" }];
+    state.category = btn.dataset.category || null;
+    const rootName = state.view === "category" ? CATEGORY_LABELS[state.category] : "Библиотека";
+    state.folderStack = [{ id: 0, name: rootName }];
     $("#search-input").value = "";
     state.searchQuery = "";
     refresh();
@@ -128,6 +148,7 @@ $("#search-input").addEventListener("input", (e) => {
     state.view = "search";
   } else {
     state.view = "library";
+    state.category = null;
     document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
     $('.nav-item[data-view="library"]').classList.add("active");
   }
@@ -137,7 +158,7 @@ $("#search-input").addEventListener("input", (e) => {
 function renderBreadcrumb() {
   const bc = $("#breadcrumb");
   bc.innerHTML = "";
-  if (state.view !== "library") {
+  if (state.view !== "library" && state.view !== "category") {
     const label = { favorites: "Избранное", trash: "Корзина", search: "Поиск" }[state.view];
     const span = document.createElement("span");
     span.className = "current";
@@ -171,12 +192,24 @@ function currentFolderId() {
 
 async function refresh() {
   renderBreadcrumb();
-  $("#toolbar").hidden = state.view !== "library";
+  $("#toolbar").hidden = state.view !== "library" && state.view !== "category";
   $("#content-error").hidden = true;
   try {
     let entries;
     if (state.view === "library") {
       entries = await api(`/api/library?folder_id=${currentFolderId()}`);
+    } else if (state.view === "category") {
+      // Фильтр строго по этой папке (не рекурсивный /api/search) — тот же
+      // принцип, что в desktop/app/main_window.py и Android LibraryScreen:
+      // папка привязана к категории один раз при создании (folder_category),
+      // а не пересчитывается по тому, что в неё положат; файлы — по
+      // расширению. core::Container::search()'s category-фильтр этого не
+      // умеет (categorize() смотрит на имя записи, у папок расширения нет),
+      // поэтому фильтруем на клиенте поверх обычного /api/library.
+      const all = await api(`/api/library?folder_id=${currentFolderId()}`);
+      entries = all.filter((e) =>
+        e.is_folder ? e.folder_category === state.category : categoryOf(e.name) === state.category
+      );
     } else if (state.view === "trash") {
       entries = await api("/api/trash");
     } else if (state.view === "favorites") {
@@ -206,13 +239,51 @@ function renderGrid(entries) {
   }
 }
 
+// Настоящее превью для фото/видео вместо эмодзи-иконки (по прямому запросу
+// пользователя — "как на ПК"). Не отдельный thumbnail-эндпоинт: /api/files/
+// {id}/download уже отдаёт Content-Disposition: inline и поддерживает Range
+// (нужно для видео) — картинка/видео просто встраивается напрямую, без
+// нового кода на бэкенде.
+function isPreviewable(entry) {
+  const mime = entry.mime_hint || "";
+  return mime.startsWith("image/") || mime.startsWith("video/");
+}
+
 function renderCard(entry) {
   const card = document.createElement("div");
   card.className = "file-card";
 
   const icon = document.createElement("div");
   icon.className = "icon";
-  icon.textContent = iconFor(entry);
+  if (!entry.is_folder && isPreviewable(entry)) {
+    const url = `/api/files/${entry.file_id}/download`;
+    if (entry.mime_hint.startsWith("video/")) {
+      const video = document.createElement("video");
+      video.className = "thumb";
+      video.src = url;
+      video.muted = true;
+      video.preload = "metadata";
+      // preload="metadata" не гарантирует видимый первый кадр во всех
+      // браузерах без явного currentTime — нашлось вживую (Firefox
+      // показывал чёрный прямоугольник, пока не выставлен currentTime).
+      video.addEventListener("loadedmetadata", () => {
+        try {
+          video.currentTime = Math.min(0.5, video.duration || 0);
+        } catch (_) {
+          /* некоторые форматы не позволяют seek до полной загрузки — не критично */
+        }
+      });
+      icon.appendChild(video);
+    } else {
+      const img = document.createElement("img");
+      img.className = "thumb";
+      img.src = url;
+      img.alt = "";
+      icon.appendChild(img);
+    }
+  } else {
+    icon.textContent = iconFor(entry);
+  }
   card.appendChild(icon);
 
   const name = document.createElement("div");
@@ -228,7 +299,7 @@ function renderCard(entry) {
 
   card.addEventListener("click", (e) => {
     if (e.target.closest(".actions")) return;
-    if (entry.is_folder && state.view === "library") {
+    if (entry.is_folder && (state.view === "library" || state.view === "category")) {
       state.folderStack.push({ id: entry.file_id, name: entry.name });
       refresh();
     } else if (!entry.is_folder) {
@@ -332,10 +403,14 @@ $("#new-folder-btn").addEventListener("click", async () => {
   const name = await showPrompt("Название папки:");
   if (!name) return;
   try {
+    // category — папка "привязывается" к вкладке один раз при создании
+    // (folder_category), null в "Библиотеке" — тот же принцип, что и в
+    // Desktop/Android (см. фильтр в refresh() выше).
+    const category = state.view === "category" ? state.category : null;
     await api("/api/folders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, parent_id: currentFolderId() }),
+      body: JSON.stringify({ name, parent_id: currentFolderId(), category }),
     });
     refresh();
   } catch (err) {
